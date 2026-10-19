@@ -25,10 +25,12 @@ A self-hosted, fully-auditable alternative to [helo](https://github.com/ryha0008
 ## Install
 
 ```bash
-cp cell ~/bin/cell        # or ~/.local/bin — anywhere in PATH
+curl -fsSL https://raw.githubusercontent.com/thedev-8/cell/main/cell -o ~/bin/cell   # or ~/.local/bin — anywhere in PATH
 chmod +x ~/bin/cell
 cell init
 ```
+
+Or clone this repo and copy the single `cell` file. Update later by re-running the same `curl` line.
 
 Requires Python 3.11+ (for `tomllib`). No other dependencies, ever.
 
