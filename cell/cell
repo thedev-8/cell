@@ -1,0 +1,2432 @@
+#!/usr/bin/env python3
+"""
+cell — isolated environments for AI agent CLIs.
+
+Like Python venvs, but for AI runtimes: each agent gets its own config,
+API key, model, persona and memory — scoped to the project you run it in.
+
+Design goals (and why):
+  * One file, Python standard library only. You can read every line of
+    what you are running. No build step, no dependencies, no supply chain.
+  * Runtimes and providers are DATA (tables in your config file), not
+    code. Adding a new AI CLI or a new LLM subscription never requires
+    editing this script: `cell runtime add`, `cell provider add`.
+  * Nothing is hidden: `cell show` prints the exact environment, files
+    and command before anything launches, with secrets masked.
+  * Secrets never land inside your project: API keys live in
+    ~/.config/cell/config.toml (chmod 600) or in env vars, and reach the
+    runtime only through the process environment at launch.
+
+Config:  ~/.config/cell/config.toml   (override with $CELL_HOME)
+Usage:   cell            (interactive menu)
+         cell --help     (all commands)
+"""
+
+import sys
+
+if sys.version_info < (3, 11):
+    sys.exit("error: cell needs Python 3.11+ (for tomllib); you have "
+             f"{sys.version.split()[0]}")
+
+import argparse
+import datetime
+import getpass
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import tomllib
+import array
+import math
+import select
+import shlex
+import time
+import urllib.error
+import urllib.request
+import uuid
+import wave
+from pathlib import Path
+
+APP = "cell"
+VERSION = "2.1.0"
+
+
+class CellError(Exception):
+    """A user-facing error. Printed as 'error: …', exit code 1."""
+
+
+# --------------------------------------------------------------------------
+# Paths
+# --------------------------------------------------------------------------
+
+def config_dir() -> Path:
+    override = os.environ.get("CELL_HOME")
+    if override:
+        return Path(override).expanduser()
+    xdg = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
+    return Path(xdg) / APP
+
+
+def config_path() -> Path:
+    return config_dir() / "config.toml"
+
+
+def seed_dir(runtime: str) -> Path:
+    """Files under ~/.config/cell/seed/<runtime>/ are copied into every new
+    instance dir of that runtime (never overwriting). Use it for hook
+    scripts, a settings.json baseline, or anything a runtime expects."""
+    return config_dir() / "seed" / runtime
+
+
+def templates_dir() -> Path:
+    return config_dir() / "templates"
+
+
+# --------------------------------------------------------------------------
+# Built-in knowledge. Everything here is a DEFAULT: the [runtimes] and
+# [providers] tables in your config override or extend it. Nothing is
+# consulted at decision time except the merged result.
+# --------------------------------------------------------------------------
+
+# A runtime is any CLI that can be pointed at a private config dir with one
+# environment variable. Fields:
+#   binary        executable name
+#   env_var       env var that relocates the CLI's home/config dir
+#   config        "claude" = cell manages <dir>/settings.json (env, model,
+#                 permissions, hooks); "none" = cell only exports env vars
+#   model_mode    "settings" = model seeded into settings.json (your in-app
+#                 /model choice persists); "flag" = passed on every launch
+#   prompt_flag / resume_flag / continue_flag / model_flag
+#   permission_flags   map of cell permission names -> CLI flags
+#   persona_file  file name written/linked in the env dir for the persona
+#   global_dir    the CLI's default home (for `cell clean --global`)
+#   install_unix / install_windows   installer one-liners
+DEFAULT_RUNTIMES = {
+    "claude": {
+        "binary": "claude",
+        "env_var": "CLAUDE_CONFIG_DIR",
+        "config": "claude",
+        "model_mode": "settings",
+        "prompt_flag": "-p",
+        "resume_flag": "--resume",
+        "continue_flag": "--continue",
+        "model_flag": "--model",
+        "permission_flags": {},          # handled via settings.json instead
+        "persona_file": "CLAUDE.md",
+        "global_dir": ".claude",
+        "install_unix": "curl -fsSL https://claude.ai/install.sh | bash",
+        "install_windows": "irm https://claude.ai/install.ps1 | iex",
+    },
+    "kimi": {
+        "binary": "kimi",
+        "env_var": "KIMI_CODE_HOME",
+        "config": "none",
+        "model_mode": "flag",
+        "prompt_flag": "-p",
+        "resume_flag": "-S",
+        "continue_flag": "-c",
+        "model_flag": "-m",
+        "permission_flags": {"bypass": "--auto", "accept-edits": "--yolo", "plan": "--plan"},
+        "persona_file": "AGENTS.md",
+        "global_dir": ".kimi-code",
+        "install_unix": "curl -fsSL https://code.kimi.ai/kimi-code/install.sh | bash",
+        "install_windows": "irm https://code.kimi.ai/kimi-code/install.ps1 | iex",
+    },
+}
+
+# A provider is an LLM subscription / API account. Fields:
+#   key_env       env var the key is read from when nothing else is set
+#   base_url      Anthropic-compatible endpoint (what the claude runtime
+#                 needs to talk to this provider). Empty = Anthropic itself.
+#   auth          "token" -> ANTHROPIC_AUTH_TOKEN, "api-key" -> ANTHROPIC_API_KEY
+#   login         true if the runtime can log in to this provider itself
+#                 (subscription / OAuth), so no key is required
+#   token         fixed token value when the endpoint wants a placeholder
+#   tiers         model ids for the opus/sonnet/haiku/fable aliases
+#                 (unset tiers fall back to the blueprint's model)
+#   env           extra env vars written to settings.json for this provider
+#   kimi_catalog  models.dev id used by `kimi provider catalog add`
+#   default_model suggested model in guided `cell add`
+#   note          one line shown in `cell provider list`
+#   docs          where the values above came from
+DEFAULT_PROVIDERS = {
+    "anthropic": {
+        "key_env": "ANTHROPIC_API_KEY",
+        "auth": "api-key",
+        "login": True,
+        "kimi_catalog": "anthropic",
+        "default_model": "opus",
+        "note": "Claude subscription (login) or API key",
+        "docs": "https://code.claude.com/docs/en/env-vars",
+    },
+    "zai": {
+        "key_env": "ZAI_API_KEY",
+        "base_url": "https://api.z.ai/api/anthropic",
+        "auth": "token",
+        "tiers": {"haiku": "glm-5.3-flash"},
+        "env": {"API_TIMEOUT_MS": "3000000"},
+        "kimi_catalog": "zai-coding-plan",
+        "default_model": "glm-5.3",
+        "note": "Z.ai GLM (coding plan or API)",
+        "docs": "https://docs.z.ai/devpack/tool/claude",
+    },
+    "moonshot": {
+        "key_env": "MOONSHOT_API_KEY",
+        "base_url": "https://api.moonshot.ai/anthropic",
+        "auth": "token",
+        "tiers": {"haiku": "kimi-k2.7-code"},
+        "kimi_catalog": "moonshotai",
+        "default_model": "kimi-k3",
+        "note": "Kimi models via the Moonshot API key",
+        "docs": "https://platform.kimi.ai/docs/guide/claude-code-kimi",
+    },
+    "kimi": {
+        "key_env": "KIMI_API_KEY",
+        "login": True,
+        "kimi_catalog": "kimi-code-plan-global",
+        "default_model": "kimi-code/k3",
+        "note": "Kimi Code subscription (login inside the kimi runtime)",
+        "docs": "https://code.kimi.com/kimi-code/",
+    },
+    "deepseek": {
+        "key_env": "DEEPSEEK_API_KEY",
+        "base_url": "https://api.deepseek.com/anthropic",
+        "auth": "token",
+        "tiers": {"haiku": "deepseek-flash"},
+        "kimi_catalog": "deepseek",
+        "default_model": "deepseek-v4-pro",
+        "note": "DeepSeek API",
+        "docs": "https://api-docs.deepseek.com/quick_start/agent_integrations/claude_code",
+    },
+    "minimax": {
+        "key_env": "MINIMAX_API_KEY",
+        "base_url": "https://api.minimax.io/anthropic",
+        "auth": "token",
+        "kimi_catalog": "minimax",
+        "default_model": "MiniMax-M3",
+        "note": "MiniMax (api.minimax.io; China: api.minimax.cn)",
+        "docs": "https://platform.minimax.io/docs/coding-plan/claude-code",
+    },
+    "openrouter": {
+        "key_env": "OPENROUTER_API_KEY",
+        "base_url": "https://openrouter.ai/api",
+        "auth": "token",
+        "kimi_catalog": "openrouter",
+        "default_model": "anthropic/claude-sonnet-4.5",
+        "note": "any model via OpenRouter (ids like vendor/model)",
+        "docs": "https://openrouter.ai/docs/guides/guides/claude-code-integration",
+    },
+    "qwen": {
+        "key_env": "DASHSCOPE_API_KEY",
+        "base_url": "https://coding-intl.dashscope.aliyuncs.com/apps/anthropic",
+        "auth": "token",
+        "kimi_catalog": "alibaba-coding-plan",
+        "default_model": "qwen3.7-plus",
+        "note": "Alibaba Model Studio coding plan (other plans: --base-url)",
+        "docs": "https://www.alibabacloud.com/help/en/model-studio/claude-code",
+    },
+    "ollama": {
+        "key_env": "OLLAMA_API_KEY",
+        "base_url": "http://localhost:11434",
+        "auth": "token",
+        "token": "ollama",
+        "default_model": "qwen3.5",
+        "note": "local Ollama server (no key needed)",
+        "docs": "https://docs.ollama.com/integrations/claude-code",
+    },
+    "openai": {
+        "key_env": "OPENAI_API_KEY",
+        "kimi_catalog": "openai",
+        "default_model": "gpt-5.5",
+        "note": "no Anthropic-compatible endpoint: use with kimi, or add a proxy URL",
+        "docs": "https://platform.openai.com/docs",
+    },
+}
+
+MODEL_TIERS = ("opus", "sonnet", "haiku", "fable")
+
+# cell permission name -> claude settings.json permissions.defaultMode
+CLAUDE_PERMISSION_MODES = {
+    "bypass": "bypassPermissions",
+    "accept-edits": "acceptEdits",
+    "plan": "plan",
+    "auto": "auto",
+    "default": "default",
+}
+PERMISSION_NAMES = tuple(CLAUDE_PERMISSION_MODES)
+
+PERSONAS = {
+    "coding": (
+        "You are a senior software engineer. Write clean, minimal, well-tested code. "
+        "Prefer editing existing code over adding new files. Ask before destructive actions."
+    ),
+    "assistant": (
+        "You are a helpful general-purpose assistant. Be concise, accurate, "
+        "and explain trade-offs when they matter."
+    ),
+    "devops": (
+        "You are a devops engineer. Prioritize reliability, reversibility, "
+        "and clear runbooks. Never run destructive commands without confirmation."
+    ),
+}
+
+SETTINGS_FILE = "settings.json"
+META_FILE = ".cell.toml"
+GIT_EXCLUDE_LINE = ".*-env-*/"
+
+
+# --------------------------------------------------------------------------
+# Tiny TOML writer (stdlib only has a reader). Handles the shape this
+# program writes: nested tables, scalars, and lists of scalars.
+# --------------------------------------------------------------------------
+
+_BARE_KEY = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def _toml_key(k: str) -> str:
+    return k if _BARE_KEY.match(k) else json.dumps(k)
+
+
+def _toml_scalar(v) -> str:
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, (int, float)):
+        return str(v)
+    if isinstance(v, (list, tuple)):
+        return "[" + ", ".join(_toml_scalar(x) for x in v) + "]"
+    return json.dumps(str(v))
+
+
+def _dump_toml(data: dict, prefix: str, out: list):
+    scalars = [(k, v) for k, v in data.items() if v is not None and not isinstance(v, dict)]
+    tables = [(k, v) for k, v in data.items() if isinstance(v, dict)]
+    if prefix and (scalars or not tables):
+        out.append(f"[{prefix}]")
+    for k, v in scalars:
+        out.append(f"{_toml_key(k)} = {_toml_scalar(v)}")
+    if scalars:
+        out.append("")
+    for k, v in tables:
+        _dump_toml(v, f"{prefix}.{_toml_key(k)}" if prefix else _toml_key(k), out)
+
+
+def dumps_toml(data: dict) -> str:
+    out: list = []
+    _dump_toml(data, "", out)
+    text = "\n".join(out).strip() + "\n"
+    return re.sub(r"\n{3,}", "\n\n", text)
+
+
+# --------------------------------------------------------------------------
+# Config
+# --------------------------------------------------------------------------
+
+SECTIONS = ("blueprints", "keys", "runtimes", "providers", "hooks", "voice")
+
+
+def empty_config() -> dict:
+    return {s: {} for s in SECTIONS}
+
+
+def load_config() -> dict:
+    path = config_path()
+    if not path.exists():
+        return empty_config()
+    try:
+        with open(path, "rb") as f:
+            cfg = tomllib.load(f)
+    except tomllib.TOMLDecodeError as e:
+        raise CellError(f"{path} is not valid TOML: {e}\n"
+                        f"fix it by hand, or move it away and run 'cell init'")
+    for s in SECTIONS:
+        if not isinstance(cfg.get(s), dict):
+            cfg[s] = {}
+    return cfg
+
+
+def save_config(cfg: dict):
+    path = config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".toml.tmp")
+    # create with owner-only permissions before any secret is written
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(dumps_toml(cfg))
+    os.replace(tmp, path)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
+def _merge(defaults: dict, override: dict) -> dict:
+    """Deep-merge user tables over built-in defaults (one level of nesting
+    for dict-valued fields such as tiers/env/permission_flags)."""
+    merged = {k: json.loads(json.dumps(v)) for k, v in defaults.items()}
+    for name, table in override.items():
+        if isinstance(table, dict) and isinstance(merged.get(name), dict):
+            for fk, fv in table.items():
+                if isinstance(fv, dict) and isinstance(merged[name].get(fk), dict):
+                    merged[name][fk].update(fv)
+                else:
+                    merged[name][fk] = fv
+        else:
+            merged[name] = table
+    return merged
+
+
+def get_runtimes(cfg: dict) -> dict:
+    return _merge(DEFAULT_RUNTIMES, cfg.get("runtimes", {}))
+
+
+def get_providers(cfg: dict) -> dict:
+    return _merge(DEFAULT_PROVIDERS, cfg.get("providers", {}))
+
+
+def get_blueprint(cfg: dict, name: str) -> dict:
+    bp = cfg["blueprints"].get(name)
+    if not bp:
+        known = ", ".join(sorted(cfg["blueprints"])) or "(none yet — see 'cell add')"
+        raise CellError(f"unknown blueprint '{name}'. Known: {known}")
+    return bp
+
+
+# --------------------------------------------------------------------------
+# Small helpers
+# --------------------------------------------------------------------------
+
+def mask(key) -> str:
+    """Mask a secret for display. Never reveals more than 6 characters."""
+    if not key:
+        return "(none)"
+    key = str(key)
+    if len(key) <= 8:
+        return "••••"
+    return f"{key[:4]}…{key[-2:]}"
+
+
+def warn(msg: str):
+    print(f"warning: {msg}", file=sys.stderr)
+
+
+def note(msg: str):
+    print(f"note: {msg}")
+
+
+def tty() -> bool:
+    return sys.stdin.isatty() and sys.stdout.isatty()
+
+
+def confirm(prompt: str, assume_yes: bool = False) -> bool:
+    if assume_yes:
+        return True
+    if not tty():
+        warn("not a terminal; refusing without --yes")
+        return False
+    try:
+        return input(f"{prompt} [y/N] ").strip().lower() in ("y", "yes")
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return False
+
+
+def ask(prompt: str, default: str = "") -> str:
+    """Prompt with an optional default; EOF/Ctrl-C return the default."""
+    try:
+        v = input(f"{prompt}{f' [{default}]' if default else ''}: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return default
+    return v or default
+
+
+def ask_secret(prompt: str) -> str:
+    try:
+        return getpass.getpass(f"{prompt}: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return ""
+
+
+def which(binary: str):
+    return shutil.which(binary) or (shutil.which(binary + ".exe") if os.name == "nt" else None)
+
+
+def camel(event: str) -> str:
+    """stop -> Stop, user_prompt_submit -> UserPromptSubmit, PostCompact -> PostCompact"""
+    if "_" not in event and event[:1].isupper():
+        return event
+    return "".join(w.capitalize() for w in event.split("_"))
+
+
+def valid_name(name: str) -> bool:
+    return bool(re.fullmatch(r"[a-z0-9][a-z0-9_-]*", name))
+
+
+def instance_dir(cwd: Path, runtime: str, name: str) -> Path:
+    return cwd / f".{runtime}-env-{name}"
+
+
+def find_instances(cwd: Path, runtimes=None):
+    """Every '.<runtime>-env-<name>' dir in the project. Known runtime names
+    are matched first so a runtime called 'gemini-cli' is split correctly."""
+    found = []
+    if not cwd.is_dir():
+        return found
+    names = sorted(runtimes or [], key=len, reverse=True)
+    for d in sorted(cwd.iterdir()):
+        if not d.is_dir() or not d.name.startswith("."):
+            continue
+        rt = name = None
+        for r in names:
+            if d.name.startswith(f".{r}-env-") and len(d.name) > len(r) + 6:
+                rt, name = r, d.name[len(r) + 6:]
+                break
+        if rt is None:
+            m = re.match(r"^\.([A-Za-z0-9_-]+?)-env-(.+)$", d.name)
+            if not m:
+                continue
+            rt, name = m.group(1), m.group(2)
+        found.append({"runtime": rt, "name": name, "path": d})
+    return found
+
+
+def read_meta(env_dir: Path) -> dict:
+    p = env_dir / META_FILE
+    if not p.exists():
+        return {}
+    try:
+        with open(p, "rb") as f:
+            return tomllib.load(f)
+    except (tomllib.TOMLDecodeError, OSError):
+        return {}
+
+
+def resolve_template(name: str):
+    """Persona template -> (text, source). Files in ~/.config/cell/templates/
+    win over the built-in one-liners."""
+    for cand in (templates_dir() / f"{name}.md", templates_dir() / name):
+        if cand.is_file():
+            return cand.read_text(encoding="utf-8"), str(cand)
+    if name in PERSONAS:
+        return PERSONAS[name], "built-in"
+    return None, None
+
+
+def template_names() -> list:
+    names = set(PERSONAS)
+    if templates_dir().is_dir():
+        names.update(p.stem for p in templates_dir().glob("*.md"))
+    return sorted(names)
+
+
+# --------------------------------------------------------------------------
+# Keys
+# --------------------------------------------------------------------------
+
+def resolve_key(cfg, bp, providers, flag_key=None):
+    """Key priority: --api-key flag > blueprint literal > blueprint key_env >
+    global [keys] > provider's key_env in your environment > provider's
+    fixed token. Returns (key, source). Blueprints with auth = "login" never
+    get a key: the runtime signs in by itself."""
+    provider = bp.get("provider", "")
+    prov = providers.get(provider, {})
+    key_env = prov.get("key_env") or f"{re.sub(r'[^A-Z0-9]', '_', provider.upper())}_API_KEY"
+    if flag_key:
+        return flag_key, "--api-key"
+    if bp.get("auth") == "login":
+        return None, "login (no key)"
+    if bp.get("api_key"):
+        return bp["api_key"], "blueprint"
+    if bp.get("key_env"):
+        if os.environ.get(bp["key_env"]):
+            return os.environ[bp["key_env"]], f"env ${bp['key_env']}"
+        return None, f"env ${bp['key_env']} (unset!)"
+    if cfg.get("keys", {}).get(provider):
+        return cfg["keys"][provider], "global keys"
+    if os.environ.get(key_env):
+        return os.environ[key_env], f"env ${key_env}"
+    if prov.get("token"):
+        return prov["token"], "provider token"
+    return None, None
+
+
+# --------------------------------------------------------------------------
+# Launch plan — built once, used by `run` and shown by `show` (dry-run)
+# --------------------------------------------------------------------------
+
+def tier_models(prov: dict, model: str) -> dict:
+    tiers = {t: model for t in MODEL_TIERS}
+    for t, m in (prov.get("tiers") or {}).items():
+        if t in tiers and m:
+            tiers[t] = m
+    return tiers
+
+
+def build_plan(cfg, name, cwd, api_key_flag=None):
+    bp = get_blueprint(cfg, name)
+    runtimes, providers = get_runtimes(cfg), get_providers(cfg)
+    rt_name = bp.get("runtime", "")
+    rt = runtimes.get(rt_name)
+    if not rt:
+        raise CellError(f"blueprint '{name}' uses unknown runtime '{rt_name}'. "
+                        f"Add it with 'cell runtime add' or fix the blueprint with 'cell edit'.")
+    provider = bp.get("provider", "")
+    prov = providers.get(provider)
+    if prov is None:
+        raise CellError(f"blueprint '{name}' uses unknown provider '{provider}'. "
+                        f"Add it with 'cell provider add' or fix the blueprint with 'cell edit'.")
+    key, key_src = resolve_key(cfg, bp, providers, api_key_flag)
+    model = bp.get("model", "")
+    plan = {
+        "name": name,
+        "runtime": rt_name,
+        "rt": rt,
+        "provider": provider,
+        "prov": prov,
+        "model": model,
+        "env_dir": instance_dir(cwd, rt_name, name),
+        "key": key or "",
+        "key_src": key_src,
+        "key_env": prov.get("key_env"),
+        "auth": bp.get("auth") or ("login" if (not key and prov.get("login")) else "key"),
+        "persona": bp.get("persona", ""),
+        "permissions": bp.get("permissions", ""),
+        "hooks": bp.get("hooks", {}) or {},
+        "settings_env": {},     # non-secret env written to settings.json (claude)
+        "process_env": {},      # env exported only at launch (secrets live here)
+        "drop_env": [],         # ambient vars removed from the child env
+        "warnings": [],
+    }
+    third_party = bool(prov.get("base_url"))
+    if rt.get("config") == "claude":
+        if third_party:
+            plan["settings_env"]["ANTHROPIC_BASE_URL"] = prov["base_url"]
+            if model:
+                for t, m in tier_models(prov, model).items():
+                    plan["settings_env"][f"ANTHROPIC_DEFAULT_{t.upper()}_MODEL"] = m
+            for k, v in (prov.get("env") or {}).items():
+                plan["settings_env"][k] = str(v)
+            if prov.get("auth", "token") == "api-key":
+                plan["drop_env"] += ["ANTHROPIC_AUTH_TOKEN"]
+                if key:
+                    plan["process_env"]["ANTHROPIC_API_KEY"] = key
+            else:
+                plan["drop_env"] += ["ANTHROPIC_API_KEY"]
+                if key:
+                    plan["process_env"]["ANTHROPIC_AUTH_TOKEN"] = key
+            if not key:
+                plan["warnings"].append(
+                    f"no API key for provider '{provider}' — set one with "
+                    f"'cell keys set {provider}' or export ${plan['key_env']}")
+        elif provider == "anthropic" or not prov:
+            plan["drop_env"] += ["ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN"]
+            if key and plan["auth"] != "login":
+                plan["process_env"]["ANTHROPIC_API_KEY"] = key
+            else:
+                plan["drop_env"].append("ANTHROPIC_API_KEY")
+        else:
+            plan["warnings"].append(
+                f"provider '{provider}' has no Anthropic-compatible endpoint, so the claude "
+                f"runtime cannot use it. Give it a proxy URL: cell provider add {provider} "
+                f"--base-url http://… --force   (or use it with the kimi runtime)")
+    if key and plan["key_env"]:
+        plan["process_env"].setdefault(plan["key_env"], key)
+    return plan
+
+
+def planned_settings(plan, cfg, existing: dict, meta: dict):
+    """Compute the settings.json cell would write for a claude-style
+    runtime, merging over whatever is there. Returns (new_settings, meta_updates)."""
+    s = json.loads(json.dumps(existing)) if existing else {}
+    env = dict(s.get("env") or {})
+    for k in meta.get("managed_env", []):
+        env.pop(k, None)
+    env.update(plan["settings_env"])
+    if env:
+        s["env"] = env
+    else:
+        s.pop("env", None)
+
+    # model: seed if absent, follow blueprint when it changes, otherwise
+    # leave the user's in-app /model choice alone.
+    applied_model = meta.get("model")
+    if plan["model"] and plan["rt"].get("model_mode", "settings") == "settings":
+        if "model" not in s or (applied_model is not None and applied_model != plan["model"]):
+            s["model"] = plan["model"]
+
+    if plan["permissions"]:
+        mode = CLAUDE_PERMISSION_MODES.get(plan["permissions"])
+        if mode:
+            perms = dict(s.get("permissions") or {})
+            perms["defaultMode"] = mode
+            s["permissions"] = perms
+            if mode == "bypassPermissions":
+                s["skipDangerousModePermissionPrompt"] = True
+            elif meta.get("permissions") == "bypass":
+                s.pop("skipDangerousModePermissionPrompt", None)
+
+    hooks = dict(s.get("hooks") or {})
+    for ev in meta.get("managed_hooks", []):
+        hooks.pop(ev, None)
+    managed_hooks = []
+    for key, cmd in (cfg.get("hooks") or {}).items():
+        if not cmd or not plan["hooks"].get(key, True):
+            continue
+        ev = camel(key)
+        hooks[ev] = [{"matcher": "", "hooks": [{"type": "command", "command": cmd}]}]
+        managed_hooks.append(ev)
+    if hooks:
+        s["hooks"] = hooks
+    else:
+        s.pop("hooks", None)
+
+    meta_updates = {
+        "managed_env": sorted(plan["settings_env"]),
+        "managed_hooks": managed_hooks,
+        "model": plan["model"],
+        "permissions": plan["permissions"],
+    }
+    return s, meta_updates
+
+
+def load_settings(env_dir: Path):
+    p = env_dir / SETTINGS_FILE
+    if not p.exists():
+        return {}
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as e:
+        stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        bak = p.with_name(f"{SETTINGS_FILE}.broken-{stamp}")
+        p.rename(bak)
+        warn(f"{p} was not valid JSON ({e}); moved to {bak.name} and starting fresh")
+        return {}
+
+
+def git_exclude(cwd: Path, env_dir: Path):
+    """Keep env dirs out of git: they hold credentials and session logs.
+    Uses .git/info/exclude so nothing in the repo itself changes."""
+    git = cwd / ".git"
+    if not git.is_dir():
+        return
+    info = git / "info"
+    try:
+        info.mkdir(exist_ok=True)
+        exc = info / "exclude"
+        text = exc.read_text(encoding="utf-8") if exc.exists() else ""
+        if GIT_EXCLUDE_LINE not in text.splitlines():
+            with open(exc, "a", encoding="utf-8") as f:
+                if text and not text.endswith("\n"):
+                    f.write("\n")
+                f.write(f"# cell: agent env dirs (credentials, sessions)\n{GIT_EXCLUDE_LINE}\n")
+    except OSError as e:
+        warn(f"could not update .git/info/exclude: {e}")
+    try:
+        r = subprocess.run(["git", "-C", str(cwd), "ls-files", "--error-unmatch", env_dir.name],
+                           capture_output=True, text=True, timeout=10)
+        if r.returncode == 0:
+            warn(f"{env_dir.name} is already committed to git (it contains credentials). "
+                 f"Untrack it: git rm -r --cached {env_dir.name} && git commit -m 'untrack env dir'")
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def copy_seed(plan):
+    src = seed_dir(plan["runtime"])
+    if not src.is_dir():
+        return []
+    copied = []
+    for p in src.rglob("*"):
+        rel = p.relative_to(src)
+        dst = plan["env_dir"] / rel
+        if p.is_dir():
+            dst.mkdir(parents=True, exist_ok=True)
+        elif not dst.exists():
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(p, dst)
+            copied.append(str(rel))
+    return copied
+
+
+def write_persona(plan):
+    """Template name -> file content; file path -> symlink (copy on
+    platforms without symlinks) so one shared file stays the source of truth."""
+    persona = plan["persona"]
+    if not persona:
+        return
+    pf = plan["env_dir"] / (plan["rt"].get("persona_file") or "AGENTS.md")
+    src = Path(persona).expanduser()
+    if src.is_file():
+        src = src.resolve()
+        if pf.is_symlink() and pf.resolve() == src:
+            return
+        if pf.exists() or pf.is_symlink():
+            pf.unlink()
+        try:
+            pf.symlink_to(src)
+        except (OSError, NotImplementedError):
+            shutil.copy2(src, pf)
+        return
+    text, _ = resolve_template(persona)
+    if text is None:
+        raise CellError(f"persona '{persona}' is neither a template ({', '.join(template_names())}) "
+                        f"nor an existing file")
+    if pf.is_symlink():
+        pf.unlink()
+    if not pf.exists() or pf.read_text(encoding="utf-8") != text.rstrip("\n") + "\n":
+        pf.write_text(text.rstrip("\n") + "\n", encoding="utf-8")
+
+
+def kimi_register_provider(plan):
+    """kimi keeps providers in its own config.toml; `kimi provider catalog add`
+    fills it from the models.dev catalog. Done once per instance dir."""
+    prov, key = plan["prov"], plan["key"]
+    cat = prov.get("kimi_catalog")
+    if plan["runtime"] != "kimi" or not cat or plan["auth"] == "login" or not key:
+        return
+    cfg_toml = plan["env_dir"] / "config.toml"
+    if cfg_toml.exists():
+        try:
+            with open(cfg_toml, "rb") as f:
+                if cat in (tomllib.load(f).get("providers") or {}):
+                    return
+        except (tomllib.TOMLDecodeError, OSError):
+            pass
+    cmd = [plan["rt"]["binary"], "provider", "catalog", "add", cat, "--api-key", key]
+    if plan["model"]:
+        cmd += ["--default-model", plan["model"].split("/", 1)[-1]]
+    if prov.get("base_url_kimi"):
+        cmd += ["--base-url", prov["base_url_kimi"]]
+    env = dict(os.environ)
+    env[plan["rt"]["env_var"]] = str(plan["env_dir"])
+    print(f"registering provider '{cat}' in kimi ({' '.join(cmd[:5])} …)")
+    try:
+        r = subprocess.run(cmd, env=env, timeout=120)
+        if r.returncode != 0:
+            warn(f"kimi provider catalog add exited {r.returncode}; configure it by hand with "
+                 f"'cell run {plan['name']} -- provider catalog add {cat} --api-key …'")
+    except (OSError, subprocess.SubprocessError) as e:
+        warn(f"could not run kimi to register the provider: {e}")
+
+
+def write_instance(plan, cfg, cwd: Path):
+    """Create/update the isolated env dir. Idempotent: re-run every launch.
+    Only cell-managed keys are touched; everything the runtime wrote stays."""
+    env_dir: Path = plan["env_dir"]
+    fresh = not env_dir.exists()
+    env_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(env_dir, 0o700)
+    except OSError:
+        pass
+    meta = read_meta(env_dir)
+    copied = copy_seed(plan)
+    write_persona(plan)
+
+    if plan["rt"].get("config") == "claude":
+        existing = load_settings(env_dir)
+        new, meta_updates = planned_settings(plan, cfg, existing, meta)
+        if new != existing or not (env_dir / SETTINGS_FILE).exists():
+            (env_dir / SETTINGS_FILE).write_text(json.dumps(new, indent=2) + "\n", encoding="utf-8")
+        meta.update(meta_updates)
+    else:
+        meta["model"] = plan["model"]
+
+    kimi_register_provider(plan)
+    meta.update({"name": plan["name"], "runtime": plan["runtime"],
+                 "provider": plan["provider"], "cell_version": VERSION})
+    (env_dir / META_FILE).write_text(dumps_toml(meta), encoding="utf-8")
+    git_exclude(cwd, env_dir)
+    return fresh, copied
+
+
+def launch_command(plan, prompt=None, resume=None, cont=False, model=None, extra=None):
+    rt = plan["rt"]
+    cmd = [rt["binary"]]
+    if cont and rt.get("continue_flag"):
+        cmd.append(rt["continue_flag"])
+    elif resume is not None and rt.get("resume_flag"):
+        cmd.append(rt["resume_flag"])
+        if isinstance(resume, str):
+            cmd.append(resume)
+    model = model or (plan["model"] if rt.get("model_mode") == "flag" else None)
+    cat = plan["prov"].get("kimi_catalog")
+    if model and plan["runtime"] == "kimi" and cat and "/" not in model and plan["auth"] != "login":
+        model = f"{cat}/{model}"          # kimi aliases are <catalog id>/<model id>
+    if model and rt.get("model_flag"):
+        cmd += [rt["model_flag"], model]
+    if plan["permissions"] and rt.get("permission_flags", {}).get(plan["permissions"]):
+        cmd.append(rt["permission_flags"][plan["permissions"]])
+    if prompt and rt.get("prompt_flag"):
+        cmd += [rt["prompt_flag"], prompt]
+    if extra:
+        cmd += extra
+    env = dict(os.environ)
+    for k in plan["drop_env"]:
+        env.pop(k, None)
+    env[rt["env_var"]] = str(plan["env_dir"])
+    env.update(plan["process_env"])
+    return cmd, env
+
+
+# --------------------------------------------------------------------------
+# Blueprint commands
+# --------------------------------------------------------------------------
+
+def _hooks_default(cfg) -> dict:
+    return {k: True for k in (cfg.get("hooks") or {})}
+
+
+def cmd_add(args, cfg):
+    name = args.name
+    if not valid_name(name):
+        raise CellError("name must be lowercase letters, digits, '-' or '_'")
+    if name in cfg["blueprints"] and not args.force:
+        raise CellError(f"blueprint '{name}' already exists (use --force to replace, or 'cell edit')")
+    runtimes, providers = get_runtimes(cfg), get_providers(cfg)
+    guided = tty()
+
+    rt_name = args.runtime
+    if not rt_name and guided:
+        opts = ", ".join(f"{r}{'' if which(rt.get('binary', '')) else ' (not installed)'}"
+                         for r, rt in sorted(runtimes.items()))
+        rt_name = ask(f"Runtime ({opts})", "claude")
+    if not rt_name:
+        raise CellError("--runtime is required")
+    if rt_name not in runtimes:
+        raise CellError(f"unknown runtime '{rt_name}'. Known: {', '.join(sorted(runtimes))}. "
+                        f"Add your own with 'cell runtime add'.")
+    rt = runtimes[rt_name]
+
+    provider = args.provider
+    if not provider and guided:
+        provider = ask(f"Provider ({', '.join(sorted(providers))})", "anthropic")
+    provider = provider or "anthropic"
+    if provider not in providers:
+        raise CellError(f"unknown provider '{provider}'. Known: {', '.join(sorted(providers))}. "
+                        f"Add your own with: cell provider add {provider} --base-url URL --key-env VAR")
+    prov = providers[provider]
+    if rt.get("config") == "claude" and provider != "anthropic" and not prov.get("base_url"):
+        raise CellError(f"provider '{provider}' has no Anthropic-compatible endpoint, so the "
+                        f"claude runtime cannot use it. Either use it with the kimi runtime, or "
+                        f"give it a proxy: cell provider add {provider} --base-url http://… --force")
+
+    model = args.model
+    if not model and guided:
+        model = ask("Model", prov.get("default_model", ""))
+    if not model:
+        raise CellError("--model is required")
+
+    auth = "login" if args.login else ""
+    if auth == "login" and not prov.get("login"):
+        raise CellError(f"provider '{provider}' has no subscription login; give it a key instead "
+                        f"(cell keys set {provider}, --api-key or --api-key-env)")
+    api_key, key_env = args.api_key or "", args.api_key_env or ""
+    if not auth and not api_key and not key_env and guided and not prov.get("token"):
+        if prov.get("login") and confirm(f"Sign in with your {provider} subscription instead of an API key?"):
+            auth = "login"
+        elif cfg["keys"].get(provider):
+            note(f"using the global key for '{provider}' ({mask(cfg['keys'][provider])})")
+        elif os.environ.get(prov.get("key_env", "")):
+            note(f"will use ${prov['key_env']} from your environment")
+        else:
+            api_key = ask_secret(f"API key for {provider} (blank = set later with 'cell keys set {provider}')")
+    if auth != "login" and api_key and key_env:
+        raise CellError("use either --api-key or --api-key-env, not both")
+
+    persona = args.persona or ""
+    if not persona and guided:
+        persona = ask(f"Persona: template ({', '.join(template_names())}) or file path, blank = none")
+    if persona and not Path(persona).expanduser().is_file() and resolve_template(persona)[0] is None:
+        raise CellError(f"persona '{persona}' is not a template or a file")
+
+    permissions = args.permissions or ""
+    if not permissions and guided:
+        permissions = ask(f"Permissions ({'/'.join(PERMISSION_NAMES)}), blank = runtime default")
+    if permissions and permissions not in PERMISSION_NAMES:
+        raise CellError(f"permissions must be one of: {', '.join(PERMISSION_NAMES)}")
+
+    bp = {
+        "runtime": rt_name,
+        "provider": provider,
+        "model": model,
+        "auth": auth,
+        "api_key": api_key,
+        "key_env": key_env,
+        "persona": persona,
+        "permissions": permissions,
+        "hooks": _hooks_default(cfg),
+    }
+    cfg["blueprints"][name] = bp
+    save_config(cfg)
+    key, src = resolve_key(cfg, bp, providers)
+    state = src if (key or auth == "login") else "no key yet"
+    print(f"added blueprint '{name}': {rt_name} / {provider} / {model}  [{state}]")
+    print(f"next: cd <project> && cell run {name}      (preview first: cell show {name})")
+
+
+def cmd_edit(args, cfg):
+    bp = get_blueprint(cfg, args.name)
+    runtimes, providers = get_runtimes(cfg), get_providers(cfg)
+    changed = []
+    if args.runtime is not None:
+        if args.runtime not in runtimes:
+            raise CellError(f"unknown runtime '{args.runtime}'. Known: {', '.join(sorted(runtimes))}")
+        bp["runtime"] = args.runtime
+        changed.append("runtime")
+    if args.provider is not None:
+        if args.provider not in providers:
+            raise CellError(f"unknown provider '{args.provider}'. Known: {', '.join(sorted(providers))}")
+        bp["provider"] = args.provider
+        changed.append("provider")
+        if bp.get("auth") == "login" and not providers[args.provider].get("login"):
+            bp["auth"] = ""
+            note(f"'{args.provider}' has no subscription login: auth reset to key "
+                 f"(cell keys set {args.provider})")
+    if args.model is not None:
+        if not args.model:
+            raise CellError("model cannot be empty")
+        bp["model"] = args.model
+        changed.append("model")
+    if args.api_key is not None:
+        bp["api_key"] = args.api_key
+        if args.api_key:
+            bp["auth"], bp["key_env"] = "", ""
+        changed.append("api_key")
+    if args.api_key_env is not None:
+        bp["key_env"] = args.api_key_env
+        if args.api_key_env:
+            bp["auth"], bp["api_key"] = "", ""
+        changed.append("key_env")
+    if args.login:
+        if not providers.get(bp.get("provider"), {}).get("login"):
+            raise CellError(f"provider '{bp.get('provider')}' has no subscription login")
+        bp["auth"], bp["api_key"], bp["key_env"] = "login", "", ""
+        changed.append("auth=login")
+    if args.persona is not None:
+        if args.persona and not Path(args.persona).expanduser().is_file() \
+                and resolve_template(args.persona)[0] is None:
+            raise CellError(f"persona '{args.persona}' is not a template or a file")
+        bp["persona"] = args.persona
+        changed.append("persona")
+    if args.permissions is not None:
+        if args.permissions and args.permissions not in PERMISSION_NAMES:
+            raise CellError(f"permissions must be one of: {', '.join(PERMISSION_NAMES)} (or '' to clear)")
+        bp["permissions"] = args.permissions
+        changed.append("permissions")
+    hooks = dict(bp.get("hooks") or {})
+    for h in (cfg.get("hooks") or {}):
+        hooks.setdefault(h, True)
+    if args.no_hooks is not None:
+        for h in (args.no_hooks or list(hooks)):
+            hooks[h] = False
+        changed.append("hooks")
+    if args.hooks is not None:
+        for h in (args.hooks or list(hooks)):
+            hooks[h] = True
+        changed.append("hooks")
+    bp["hooks"] = hooks
+    if not changed:
+        raise CellError("nothing to change — see 'cell edit --help'")
+    save_config(cfg)
+    print(f"updated '{args.name}': {', '.join(changed)}  (applies on next 'cell run')")
+
+
+def cmd_list(args, cfg):
+    bps = cfg.get("blueprints", {})
+    if not bps:
+        print("no blueprints yet — create one with: cell add <name>")
+        return
+    providers = get_providers(cfg)
+    for name, bp in sorted(bps.items()):
+        key, src = resolve_key(cfg, bp, providers)
+        if bp.get("auth") == "login":
+            state = "login"
+        elif key:
+            state = "key: " + src
+        elif providers.get(bp.get("provider"), {}).get("login"):
+            state = "login (no key; runtime signs in)"
+        else:
+            state = "NO KEY"
+        print(f"  {name:<16} {bp.get('runtime',''):<8} {bp.get('provider','')}/{bp.get('model','')}"
+              f"  [{state}]")
+
+
+def cmd_remove(args, cfg):
+    get_blueprint(cfg, args.name)
+    del cfg["blueprints"][args.name]
+    save_config(cfg)
+    print(f"removed blueprint '{args.name}' (instance dirs stay; 'cell clean {args.name}' deletes them)")
+
+
+def _pick_blueprint(args, cfg) -> str:
+    if args.name:
+        return args.name
+    bps = sorted(cfg.get("blueprints", {}))
+    if not bps:
+        raise CellError("no blueprints defined. Use 'cell add' first.")
+    here = {i["name"] for i in find_instances(Path.cwd(), get_runtimes(cfg))} & set(bps)
+    if len(here) == 1:
+        return next(iter(here))
+    if len(bps) == 1:
+        return bps[0]
+    raise CellError(f"which blueprint? {', '.join(bps)}")
+
+
+def _print_plan(plan, cmd, env, fresh_note=True):
+    rt, env_dir = plan["rt"], plan["env_dir"]
+    print(f"blueprint    {plan['name']}")
+    print(f"runtime      {plan['runtime']} ({rt['binary']}: {which(rt['binary']) or 'NOT FOUND'})")
+    print(f"provider     {plan['provider']}  {plan['prov'].get('base_url') or '(first-party)'}")
+    print(f"model        {plan['model'] or '(runtime default)'}")
+    if plan["permissions"]:
+        print(f"permissions  {plan['permissions']}")
+    if plan["persona"]:
+        print(f"persona      {plan['persona']}")
+    print(f"env dir      {env_dir}{'' if env_dir.exists() else '  (will be created)'}")
+    print(f"auth         {'login (runtime signs in itself)' if plan['auth'] == 'login' else (mask(plan['key']) + '  from ' + str(plan['key_src']) if plan['key'] else 'NO KEY')}")
+    if plan["settings_env"]:
+        print("settings.json env:")
+        for k, v in plan["settings_env"].items():
+            print(f"    {k}={v}")
+    print("process env:")
+    print(f"    {rt['env_var']}={env_dir}")
+    for k, v in plan["process_env"].items():
+        print(f"    {k}={mask(v)}")
+    for k in plan["drop_env"]:
+        if k in os.environ:
+            print(f"    unset {k}  (was set in your shell)")
+    print(f"command      {' '.join(cmd)}")
+    for w in plan["warnings"]:
+        warn(w)
+
+
+def cmd_show(args, cfg):
+    """Dry-run: print exactly what would happen, secrets masked."""
+    name = _pick_blueprint(args, cfg)
+    plan = build_plan(cfg, name, Path.cwd(), api_key_flag=args.api_key)
+    cmd, env = launch_command(plan, args.prompt, args.resume, args.cont, args.model, args.extra)
+    _print_plan(plan, cmd, env)
+    if plan["rt"].get("config") == "claude":
+        existing = load_settings(plan["env_dir"]) if plan["env_dir"].exists() else {}
+        new, _ = planned_settings(plan, cfg, existing, read_meta(plan["env_dir"]))
+        if new != existing:
+            print("settings.json changes:")
+            for k in sorted(set(existing) | set(new)):
+                if existing.get(k) != new.get(k):
+                    print(f"    {k}: {json.dumps(existing.get(k))[:60]} -> {json.dumps(new.get(k))[:60]}")
+
+
+def cmd_run(args, cfg):
+    name = _pick_blueprint(args, cfg)
+    cwd = Path.cwd()
+    plan = build_plan(cfg, name, cwd, api_key_flag=args.api_key)
+    binary = plan["rt"]["binary"]
+    if not which(binary):
+        raise CellError(f"'{binary}' is not installed or not in PATH. "
+                        f"Try: cell runtime install {plan['runtime']}")
+    prompt, extra = args.prompt, list(args.extra or [])
+    if getattr(args, "voice", False):
+        spoken = voice_capture_text(cfg)
+        print(f"you said: {spoken}")
+        if prompt:
+            prompt = f"{prompt}\n\n{spoken}"
+        else:
+            extra.insert(0, spoken)           # positional prompt: the session opens with it
+    if prompt and not plan["rt"].get("prompt_flag"):
+        note(f"runtime '{plan['runtime']}' has no prompt flag configured; passing the prompt as a plain argument")
+        extra.append(prompt)
+        prompt = None
+    if args.resume is not None and not plan["rt"].get("resume_flag"):
+        note(f"runtime '{plan['runtime']}' has no resume flag configured; ignoring --resume")
+    if args.cont and not plan["rt"].get("continue_flag"):
+        note(f"runtime '{plan['runtime']}' has no continue flag configured; ignoring --continue")
+    fresh, copied = write_instance(plan, cfg, cwd)
+    cmd, env = launch_command(plan, prompt, args.resume, args.cont, args.model, extra)
+    for w in plan["warnings"]:
+        warn(w)
+    if fresh:
+        print(f"created {plan['env_dir']}" + (f" (+{len(copied)} seed files)" if copied else ""))
+        if plan["auth"] == "login":
+            note(f"first launch: {binary} will ask you to log in; that login stays private to this env dir")
+    else:
+        print(f"→ {plan['env_dir']}")
+    sys.stdout.flush()
+    exec_runtime(cmd, env)
+
+
+def exec_runtime(cmd, env):
+    """Hand the terminal over to the runtime. On POSIX we *replace* this
+    process (like `exec` in a shell): Ctrl-C then reaches only the runtime,
+    which handles it itself. A wrapper that merely waits would get the same
+    SIGINT and kill its child."""
+    path = which(cmd[0])
+    if path:
+        cmd[0] = path
+    if os.name != "nt" and hasattr(os, "execvpe"):
+        try:
+            os.execvpe(cmd[0], cmd, env)
+        except OSError as e:
+            raise CellError(f"could not launch '{cmd[0]}': {e}")
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    try:
+        p = subprocess.Popen(cmd, env=env)
+    except OSError as e:
+        raise CellError(f"could not launch '{cmd[0]}': {e}")
+    while True:
+        try:
+            sys.exit(p.wait())
+        except KeyboardInterrupt:
+            continue
+
+
+# --------------------------------------------------------------------------
+# Keys, providers, runtimes, hooks
+# --------------------------------------------------------------------------
+
+def _get_key_arg(args, what: str) -> str:
+    key = args.key
+    if not key:
+        if not tty():
+            raise CellError("key value required (or run in a terminal to be prompted)")
+        key = ask_secret(f"{what} (input hidden)")
+        if not key:
+            raise CellError("no key entered")
+    return key
+
+
+def cmd_keys(args, cfg):
+    providers = get_providers(cfg)
+    if args.action == "set":
+        if not args.provider:
+            raise CellError("provider name required: cell keys set <provider> [key]")
+        if args.provider not in providers:
+            warn(f"'{args.provider}' is not a known provider ({', '.join(sorted(providers))}); storing anyway")
+        key = _get_key_arg(args, f"API key for {args.provider}")
+        cfg["keys"][args.provider] = key
+        save_config(cfg)
+        print(f"stored key for '{args.provider}' ({mask(key)}) — used by every blueprint on that provider")
+    elif args.action == "list":
+        if not cfg["keys"]:
+            print("no global keys stored (cell keys set <provider>)")
+        for prov, key in sorted(cfg["keys"].items()):
+            print(f"  {prov:<14} {mask(key)}")
+    elif args.action == "remove":
+        if not args.provider:
+            raise CellError("provider name required")
+        if cfg["keys"].pop(args.provider, None) is None:
+            raise CellError(f"no global key stored for '{args.provider}'")
+        save_config(cfg)
+        print(f"removed key for '{args.provider}'")
+
+
+def cmd_key(args, cfg):
+    bp = get_blueprint(cfg, args.name)
+    key = _get_key_arg(args, f"API key for blueprint {args.name}")
+    bp["api_key"], bp["auth"], bp["key_env"] = key, "", ""
+    save_config(cfg)
+    print(f"key set on '{args.name}' ({mask(key)})")
+
+
+def _kv_pairs(items, what):
+    out = {}
+    for it in items or []:
+        if "=" not in it:
+            raise CellError(f"{what} expects KEY=VALUE, got '{it}'")
+        k, v = it.split("=", 1)
+        out[k.strip()] = v.strip()
+    return out
+
+
+def cmd_provider(args, cfg):
+    providers = get_providers(cfg)
+    if args.action == "list":
+        used = {}
+        for bn, bp in cfg["blueprints"].items():
+            used.setdefault(bp.get("provider"), []).append(bn)
+        for name, p in sorted(providers.items()):
+            custom = "custom " if name in cfg["providers"] and name not in DEFAULT_PROVIDERS else ""
+            key = "key ✓" if cfg["keys"].get(name) else ("$" + p.get("key_env", "") if os.environ.get(p.get("key_env", "")) else "no key")
+            ep = p.get("base_url") or ("login/first-party" if name == "anthropic" else "(no claude endpoint)")
+            print(f"  {name:<12} {custom}{ep:<58} {key:<22} {p.get('note','')}")
+            if used.get(name):
+                print(f"  {'':<12} used by: {', '.join(used[name])}")
+        print("\nadd your own: cell provider add NAME --base-url URL --key-env VAR   (cell provider add --help)")
+    elif args.action == "show":
+        if not args.name or args.name not in providers:
+            raise CellError(f"provider name required, one of: {', '.join(sorted(providers))}")
+        print(dumps_toml({"providers": {args.name: providers[args.name]}}), end="")
+    elif args.action == "add":
+        name = args.name
+        if not name or not valid_name(name):
+            raise CellError("provider name required (lowercase letters, digits, '-' or '_')")
+        if name in providers and not args.force:
+            raise CellError(f"provider '{name}' already exists (use --force to override its fields)")
+        entry = dict(cfg["providers"].get(name, {}))
+        if args.base_url:
+            entry["base_url"] = args.base_url.rstrip("/")
+        if args.key_env:
+            entry["key_env"] = args.key_env
+        if args.auth:
+            entry["auth"] = args.auth
+        if args.token:
+            entry["token"] = args.token
+        if args.tier:
+            tiers = dict(entry.get("tiers") or {})
+            for t, m in _kv_pairs(args.tier, "--tier").items():
+                if t not in MODEL_TIERS:
+                    raise CellError(f"--tier name must be one of {', '.join(MODEL_TIERS)}")
+                tiers[t] = m
+            entry["tiers"] = tiers
+        if args.env:
+            env = dict(entry.get("env") or {})
+            env.update(_kv_pairs(args.env, "--env"))
+            entry["env"] = env
+        if args.kimi_catalog:
+            entry["kimi_catalog"] = args.kimi_catalog
+        if args.default_model:
+            entry["default_model"] = args.default_model
+        if args.note:
+            entry["note"] = args.note
+        if args.docs:
+            entry["docs"] = args.docs
+        if args.login:
+            entry["login"] = True
+        if name not in DEFAULT_PROVIDERS:
+            entry.setdefault("key_env", f"{re.sub(r'[^A-Z0-9]', '_', name.upper())}_API_KEY")
+            entry.setdefault("auth", "token")
+            if not entry.get("base_url") and not entry.get("login"):
+                warn("no --base-url: the claude runtime cannot use this provider; "
+                     "other runtimes get its key via $" + entry["key_env"])
+        if not entry:
+            raise CellError("nothing to set — see 'cell provider add --help'")
+        cfg["providers"][name] = entry
+        save_config(cfg)
+        print(f"{'updated' if name in providers else 'added'} provider '{name}'")
+        print(f"next: cell keys set {name}   then   cell add <blueprint> --provider {name} --model <model>")
+    elif args.action == "remove":
+        if args.name not in cfg["providers"]:
+            if args.name in DEFAULT_PROVIDERS:
+                raise CellError(f"'{args.name}' is built-in; override fields with 'cell provider add {args.name} --force …'")
+            raise CellError(f"unknown provider '{args.name}'")
+        users = [bn for bn, bp in cfg["blueprints"].items() if bp.get("provider") == args.name]
+        if users and not args.force:
+            raise CellError(f"provider '{args.name}' is used by: {', '.join(users)} (use --force)")
+        del cfg["providers"][args.name]
+        save_config(cfg)
+        print(f"removed provider '{args.name}'" + (" (built-in defaults restored)" if args.name in DEFAULT_PROVIDERS else ""))
+
+
+def cmd_runtime(args, cfg):
+    runtimes = get_runtimes(cfg)
+    if args.action == "list":
+        for name, rt in sorted(runtimes.items()):
+            path = which(rt.get("binary", ""))
+            state = f"installed ({path})" if path else "missing"
+            custom = " (custom)" if name in cfg["runtimes"] and name not in DEFAULT_RUNTIMES else ""
+            print(f"  {name:<10} {rt.get('binary','?'):<10} env: {rt.get('env_var','?'):<20} {state}{custom}")
+    elif args.action == "add":
+        if not args.name or not valid_name(args.name):
+            raise CellError("runtime name required (lowercase letters, digits, '-' or '_')")
+        if args.name in runtimes and not args.force:
+            raise CellError(f"runtime '{args.name}' already exists (use --force to override fields)")
+        entry = dict(cfg["runtimes"].get(args.name, {}))
+        if args.name not in DEFAULT_RUNTIMES and not (args.binary and args.env_var) \
+                and not (entry.get("binary") and entry.get("env_var")):
+            raise CellError("runtime add needs --binary and --env-var (the env var that relocates its config dir)")
+        for field in ("binary", "env_var", "prompt_flag", "resume_flag", "continue_flag",
+                      "model_flag", "persona_file", "global_dir", "install_unix", "install_windows"):
+            v = getattr(args, field, None)
+            if v is not None:
+                entry[field] = v
+        if args.config:
+            entry["config"] = args.config
+        if args.model_mode:
+            entry["model_mode"] = args.model_mode
+        if args.name not in DEFAULT_RUNTIMES:
+            entry.setdefault("config", "none")
+            entry.setdefault("model_mode", "flag")
+        cfg["runtimes"][args.name] = entry
+        save_config(cfg)
+        print(f"{'updated' if args.name in runtimes else 'added'} runtime '{args.name}' — no rebuild needed")
+        if not which(entry.get("binary", "")):
+            note(f"'{entry.get('binary')}' is not in PATH yet")
+    elif args.action == "install":
+        rt = runtimes.get(args.name or "")
+        if not rt:
+            raise CellError(f"unknown runtime '{args.name}'. Known: {', '.join(sorted(runtimes))}")
+        cmd_str = rt.get("install_windows" if os.name == "nt" else "install_unix")
+        if not cmd_str:
+            raise CellError(f"no installer known for '{args.name}' — install it manually")
+        print(f"this will run:\n  {cmd_str}")
+        if not confirm("Proceed?", args.yes):
+            return
+        code = subprocess.call(cmd_str, shell=True)
+        if code != 0:
+            raise CellError(f"installer exited with {code}")
+    elif args.action == "remove":
+        if args.name not in cfg.get("runtimes", {}):
+            if args.name in DEFAULT_RUNTIMES:
+                raise CellError(f"'{args.name}' is built-in and has no overrides to remove")
+            raise CellError(f"unknown runtime '{args.name}'")
+        users = [bn for bn, bp in cfg["blueprints"].items() if bp.get("runtime") == args.name]
+        if users and args.name not in DEFAULT_RUNTIMES and not args.force:
+            raise CellError(f"runtime '{args.name}' is used by: {', '.join(users)} (use --force)")
+        del cfg["runtimes"][args.name]
+        save_config(cfg)
+        print(f"removed runtime '{args.name}' from config")
+
+
+def cmd_hooks(args, cfg):
+    hooks = cfg.setdefault("hooks", {})
+    if args.action == "list":
+        if not hooks:
+            print("no hooks configured (cell hooks set <event> '<command>', or cell hooks import <env-dir>)")
+        for ev, cmd in hooks.items():
+            print(f"  {ev:<20} -> {camel(ev)}\n      {cmd}")
+    elif args.action == "set":
+        if not args.event or not args.command:
+            raise CellError("usage: cell hooks set <event> '<shell command>'   (event: stop, user_prompt_submit, post_compact, …)")
+        hooks[args.event] = args.command
+        save_config(cfg)
+        print(f"hook '{args.event}' ({camel(args.event)}) set — applied to every claude blueprint on next run")
+    elif args.action == "remove":
+        if args.event not in hooks:
+            raise CellError(f"no hook '{args.event}'")
+        del hooks[args.event]
+        save_config(cfg)
+        print(f"removed hook '{args.event}'")
+    elif args.action == "import":
+        src = Path(args.event or ".").expanduser()
+        if src.is_dir() and (src / SETTINGS_FILE).exists():
+            src_dir = src
+        else:
+            cands = [i for i in find_instances(Path.cwd(), get_runtimes(cfg))
+                     if (i["path"] / SETTINGS_FILE).exists()]
+            if len(cands) != 1:
+                raise CellError("give the env dir to import from: cell hooks import .claude-env-max")
+            src_dir = cands[0]["path"]
+        try:
+            data = json.loads((src_dir / SETTINGS_FILE).read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as e:
+            raise CellError(f"cannot read {src_dir / SETTINGS_FILE}: {e}")
+        n = 0
+        for ev, groups in (data.get("hooks") or {}).items():
+            for g in groups:
+                for h in g.get("hooks", []):
+                    if h.get("type") == "command" and h.get("command"):
+                        key = re.sub(r"(?<!^)(?=[A-Z])", "_", ev).lower()
+                        hooks[key] = h["command"]
+                        n += 1
+                        break
+                else:
+                    continue
+                break
+        copied = 0
+        if (src_dir / "hooks").is_dir():
+            dst = seed_dir("claude") / "hooks"
+            dst.mkdir(parents=True, exist_ok=True)
+            for p in (src_dir / "hooks").iterdir():
+                if p.is_file():
+                    shutil.copy2(p, dst / p.name)
+                    copied += 1
+        save_config(cfg)
+        print(f"imported {n} hook(s) from {src_dir}" + (f", {copied} script(s) -> {seed_dir('claude') / 'hooks'}" if copied else ""))
+        print("new claude envs get them automatically; existing ones on their next 'cell run'")
+
+
+# --------------------------------------------------------------------------
+# Project commands
+# --------------------------------------------------------------------------
+
+def cmd_sessions(args, cfg):
+    cwd = Path.cwd()
+    instances = find_instances(cwd, get_runtimes(cfg))
+    if args.name:
+        instances = [i for i in instances if i["name"] == args.name]
+    any_found = False
+    for inst in instances:
+        files = [f for f in inst["path"].rglob("*.jsonl")
+                 if not ({"telemetry", "cache", "file-history", "plugins", "shell-snapshots"} & set(f.parts))]
+        files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        if files:
+            any_found = True
+            print(f"{inst['name']} ({inst['runtime']}):")
+            for f in files[:args.limit]:
+                ts = datetime.datetime.fromtimestamp(f.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+                print(f"  {ts}  {f.relative_to(inst['path'])}")
+    if not any_found:
+        print("no sessions found in this project")
+
+
+def cmd_clean(args, cfg):
+    cwd = Path.cwd()
+    if args.global_runtime:
+        rt = get_runtimes(cfg).get(args.global_runtime)
+        if not rt or not rt.get("global_dir"):
+            raise CellError(f"no global dir known for runtime '{args.global_runtime}'")
+        target = Path.home() / rt["global_dir"]
+        if not target.exists():
+            print(f"{target} does not exist")
+            return
+        if confirm(f"Delete {target} (the runtime's GLOBAL config, logins included)?", args.yes):
+            shutil.rmtree(target)
+            print(f"removed {target}")
+        return
+    instances = find_instances(cwd, get_runtimes(cfg))
+    if args.name:
+        if not valid_name(args.name):
+            raise CellError("bad name")
+        instances = [i for i in instances if i["name"] == args.name]
+    if not instances:
+        print("nothing to clean")
+        return
+    for inst in instances:
+        print(f"  {inst['path']}")
+    if confirm("Delete these instance dirs (sessions and logins inside them are lost)?", args.yes):
+        for inst in instances:
+            shutil.rmtree(inst["path"])
+        print("cleaned")
+
+
+def cmd_templates(args, cfg):
+    if args.action == "list":
+        for name in template_names():
+            _, src = resolve_template(name)
+            print(f"  {name:<12} {src}")
+        print(f"\nadd your own: put <name>.md into {templates_dir()}")
+    elif args.action == "show":
+        text, _ = resolve_template(args.name or "")
+        if text is None:
+            raise CellError(f"unknown template '{args.name}'")
+        print(text)
+
+
+def cmd_status(args, cfg):
+    print(f"config      {config_path()}{'' if config_path().exists() else '  (not created yet: cell init)'}")
+    print(f"version     {APP} v{VERSION}")
+    print(f"blueprints  {len(cfg.get('blueprints', {}))}   keys {len(cfg.get('keys', {}))}   "
+          f"custom providers {len(cfg.get('providers', {}))}   hooks {len(cfg.get('hooks', {}))}")
+    runtimes = get_runtimes(cfg)
+    for name, rt in sorted(runtimes.items()):
+        print(f"runtime     {name:<10} {'installed' if which(rt.get('binary', '')) else 'missing'}")
+    insts = find_instances(Path.cwd(), runtimes)
+    if insts:
+        print("here:")
+        for i in insts:
+            meta = read_meta(i["path"])
+            tag = "" if i["name"] in cfg["blueprints"] else "  (no blueprint)"
+            print(f"  {i['path'].name:<28} {meta.get('provider','?')}/{meta.get('model','?')}{tag}")
+
+
+def cmd_doctor(args, cfg):
+    """Health check: one command answers 'is everything set up right?'"""
+    ok = True
+
+    def bad(msg):
+        nonlocal ok
+        ok = False
+        print(f"  ✗ {msg}")
+
+    print("config")
+    if config_path().exists():
+        mode = config_path().stat().st_mode & 0o777
+        print(f"  ✓ {config_path()}" + ("" if mode == 0o600 or os.name == "nt" else f"  (mode {oct(mode)}, expected 0600)"))
+    else:
+        bad("no config yet — run 'cell init'")
+    print("runtimes")
+    runtimes, providers = get_runtimes(cfg), get_providers(cfg)
+    for name, rt in sorted(runtimes.items()):
+        if which(rt.get("binary", "")):
+            print(f"  ✓ {name}: {rt['binary']} found")
+        elif any(bp.get("runtime") == name for bp in cfg["blueprints"].values()):
+            bad(f"{name}: '{rt['binary']}' not in PATH (cell runtime install {name})")
+        else:
+            print(f"  - {name}: '{rt['binary']}' not installed (unused)")
+    print("blueprints")
+    if not cfg["blueprints"]:
+        print("  (none — cell add <name>)")
+    for name, bp in sorted(cfg["blueprints"].items()):
+        rt, prov = runtimes.get(bp.get("runtime")), providers.get(bp.get("provider"))
+        if not rt:
+            bad(f"{name}: unknown runtime '{bp.get('runtime')}'")
+            continue
+        if prov is None:
+            bad(f"{name}: unknown provider '{bp.get('provider')}' (cell provider add …)")
+            continue
+        if rt.get("config") == "claude" and bp.get("provider") != "anthropic" and not prov.get("base_url"):
+            bad(f"{name}: provider '{bp.get('provider')}' has no Anthropic-compatible endpoint for the claude runtime")
+            continue
+        key, src = resolve_key(cfg, bp, providers)
+        if bp.get("auth") == "login":
+            print(f"  ✓ {name}: login (subscription)")
+        elif key:
+            print(f"  ✓ {name}: key from {src}")
+        elif prov.get("login"):
+            print(f"  ! {name}: no API key; the runtime will ask you to log in")
+        else:
+            bad(f"{name}: no API key (cell keys set {bp.get('provider')})")
+        if bp.get("persona") and not Path(bp["persona"]).expanduser().is_file() \
+                and resolve_template(bp["persona"])[0] is None:
+            bad(f"{name}: persona '{bp['persona']}' not found")
+    if cfg.get("hooks"):
+        print("hooks")
+        for ev, cmd in sorted(cfg["hooks"].items()):
+            if not isinstance(cmd, str) or not cmd:
+                continue
+            missing = sorted({w for w in re.findall(r"(?<![\w/.$-])(python3?|node|bun|deno|perl|ruby)(?=\s)", cmd)
+                              if not which(w)})
+            if missing:
+                hint = "  (use python3)" if "python" in missing and which("python3") else ""
+                bad(f"{ev}: calls {', '.join(repr(m) for m in missing)} but it is not in PATH{hint}")
+            else:
+                print(f"  ✓ {ev}")
+    if cfg.get("voice"):
+        print("voice")
+        vc = voice_cfg(cfg)
+        if vc["engine"] == "local":
+            py = voice_python(vc)
+            if py.exists() and subprocess.run([str(py), "-c", "import faster_whisper"], capture_output=True).returncode == 0:
+                mdir = voice_dir() / "models"
+                cached = mdir.is_dir() and any(p.name.endswith(f"-{vc['model']}") for p in mdir.glob("models--*"))
+                print(f"  ✓ engine local: faster-whisper, model {vc['model']}"
+                      + ("" if cached else "  (not downloaded yet: cell voice setup)"))
+            else:
+                bad(f"engine local: faster_whisper missing in {py} (cell voice setup)")
+        elif voice_api_key(cfg, vc):
+            print(f"  ✓ engine api: {vc['api_url']} ({vc['api_model']})")
+        else:
+            bad(f"engine api: no key — export {vc['api_key_env']} or 'cell keys set voice'")
+        _, rec = find_recorder(vc)
+        if rec:
+            print(f"  ✓ recorder: {rec}")
+        else:
+            bad("no recorder: install pulseaudio-utils (parecord), alsa-utils (arecord) or pipewire")
+        skill = seed_dir("claude") / "skills" / "voice" / "SKILL.md"
+        if skill.is_file():
+            print("  ✓ /voice skill seeded for claude envs")
+        else:
+            bad("/voice skill missing (cell voice setup)")
+    print("instances (this project)")
+    cwd = Path.cwd()
+    insts = find_instances(cwd, runtimes)
+    for inst in insts:
+        known = inst["name"] in cfg["blueprints"]
+        print(f"  {'✓' if known else '!'} {inst['path'].name}" + ("" if known else "  orphaned (no blueprint; cell clean " + inst["name"] + ")"))
+        if (inst["path"] / SETTINGS_FILE).exists():
+            try:
+                json.loads((inst["path"] / SETTINGS_FILE).read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                bad(f"{inst['path'].name}/settings.json is not valid JSON")
+    if not insts:
+        print("  (none)")
+    if (cwd / ".git").is_dir() and insts:
+        try:
+            r = subprocess.run(["git", "-C", str(cwd), "ls-files"] + [i["path"].name for i in insts],
+                               capture_output=True, text=True, timeout=10)
+            tracked = sorted({line.split("/", 1)[0] for line in r.stdout.splitlines() if line})
+            if tracked:
+                bad(f"committed to git (contain credentials!): {', '.join(tracked)}  "
+                    f"-> git rm -r --cached {' '.join(tracked)}")
+            else:
+                print("  ✓ none tracked by git")
+        except (OSError, subprocess.SubprocessError):
+            pass
+    print("ok" if ok else "problems found")
+    return 0 if ok else 1
+
+
+# --------------------------------------------------------------------------
+# Import from helo
+# --------------------------------------------------------------------------
+
+def _helo_config_path() -> Path:
+    xdg = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
+    return Path(xdg) / "helo" / "config.toml"
+
+
+def _bp_from_helo(data: dict, cfg: dict, helo_keys: dict | None = None) -> dict:
+    api_key = data.get("api_key", "") or ""
+    provider = data.get("provider", "") or "anthropic"
+    # helo marks a subscription login as api_key = "max", either in the
+    # blueprint or once per provider under [keys]. A login-capable provider
+    # with no key anywhere can only sign in, so record that as login too.
+    helo_key = (helo_keys or {}).get(provider, "") or ""
+    login = (api_key == "max"
+             or (not api_key and helo_key == "max")
+             or (not api_key and not helo_key and not cfg.get("keys", {}).get(provider)
+                 and bool(get_providers(cfg).get(provider, {}).get("login"))))
+    hooks = {k: bool(v) for k, v in (data.get("hooks") or {}).items()} or _hooks_default(cfg)
+    return {
+        "runtime": data.get("runtime", "claude") or "claude",
+        "provider": provider,
+        "model": data.get("model", "") or "",
+        "auth": "login" if login else "",
+        "api_key": "" if login else api_key,
+        "key_env": "",
+        "persona": data.get("claude_md", "") or "",
+        "permissions": {"bypass": "bypass", "accept-edits": "accept-edits", "plan": "plan"}.get(
+            data.get("permissions", ""), ""),
+        "hooks": hooks,
+    }
+
+
+def cmd_import(args, cfg):
+    """Import helo blueprints: from ~/.config/helo/config.toml ([[blueprints]]
+    + [keys]) and/or from .helo.toml instance files under a directory."""
+    found = []
+    helo_keys = {}
+    helo_cfg = Path(args.config).expanduser() if args.config else _helo_config_path()
+    if helo_cfg.exists():
+        try:
+            with open(helo_cfg, "rb") as f:
+                data = tomllib.load(f)
+        except tomllib.TOMLDecodeError as e:
+            raise CellError(f"{helo_cfg}: {e}")
+        for bp in data.get("blueprints") or []:
+            if isinstance(bp, dict) and bp.get("name"):
+                found.append((bp["name"], bp, helo_cfg))
+        helo_keys = {k: v for k, v in (data.get("keys") or {}).items() if isinstance(v, str)}
+        for prov, key in helo_keys.items():
+            if key and key != "max" and not cfg["keys"].get(prov):
+                cfg["keys"][prov] = key
+                print(f"  key for '{prov}' copied ({mask(key)})")
+    elif args.config:
+        raise CellError(f"{helo_cfg} not found")
+    if args.dir or not found:
+        root = Path(args.dir or ".").expanduser()
+        pattern = "**/.helo.toml" if args.recursive else "*/.helo.toml"
+        for p in sorted(root.glob(pattern)):
+            try:
+                with open(p, "rb") as f:
+                    d = tomllib.load(f)
+            except (tomllib.TOMLDecodeError, OSError):
+                continue
+            if d.get("name") and all(n != d["name"] for n, _, _ in found):
+                found.append((d["name"], d, p))
+    if not found:
+        raise CellError(f"nothing to import: no {helo_cfg} and no .helo.toml files under {args.dir or '.'}")
+    merged = {}
+    for name, data, src in found:
+        bp = _bp_from_helo(data, cfg, helo_keys)
+        if name in merged:                       # helo lists partial duplicates; later wins per field
+            for k, v in bp.items():
+                if v not in ("", None, {}):
+                    merged[name][k] = v
+        else:
+            merged[name] = bp
+    providers = get_providers(cfg)
+    for name, bp in merged.items():
+        if name in cfg["blueprints"] and not args.force:
+            print(f"  skip '{name}' (exists; --force to overwrite)")
+            continue
+        state = "login" if bp["auth"] == "login" else ("key copied" if bp["api_key"] else "")
+        if bp["provider"] not in providers:
+            state += f" (provider '{bp['provider']}' unknown: cell provider add {bp['provider']} …)"
+        print(f"  {'would import' if args.dry_run else 'imported'} '{name}': {bp['runtime']}/{bp['provider']}/{bp['model']}"
+              + (f"  persona={bp['persona']}" if bp["persona"] else "")
+              + (f"  permissions={bp['permissions']}" if bp["permissions"] else "")
+              + (f"  [{state.strip()}]" if state.strip() else ""))
+        cfg["blueprints"][name] = bp
+    if args.dry_run:
+        print("dry run — nothing written")
+        return
+    save_config(cfg)
+    print("done — check with 'cell list' and 'cell doctor'")
+    print("tip: 'cell hooks import .claude-env-<name>' copies the hooks of an existing env into cell")
+
+
+def cmd_init(args, cfg):
+    print(f"── {APP} v{VERSION} first-time setup ──")
+    existed = config_path().exists()
+    save_config(cfg)
+    print(f"config: {config_path()}{' (already existed, left as is)' if existed else ' (created)'}")
+    for d in (seed_dir("claude"), templates_dir()):
+        d.mkdir(parents=True, exist_ok=True)
+    print(f"seed:   {seed_dir('claude')}   files here are copied into every new claude env")
+    print(f"personas: {templates_dir()}   drop <name>.md files here")
+    runtimes = get_runtimes(cfg)
+    for name, rt in sorted(runtimes.items()):
+        print(f"runtime {name:<8} {'installed' if which(rt.get('binary','')) else 'missing (cell runtime install ' + name + ')'}")
+    if _helo_config_path().exists() and not cfg["blueprints"]:
+        print(f"\nhelo config found at {_helo_config_path()} — import it with: cell import")
+    print("\nnext:")
+    print("  cell add max --runtime claude --provider anthropic --model opus --login")
+    print("  cell add glm --runtime claude --provider zai --model glm-5.3   (then: cell keys set zai)")
+    print("  cd <project> && cell run max")
+    print("  cell voice setup                     (optional: speak prompts, transcribe voice notes)")
+    print("or just type 'cell' for the menu")
+
+
+# --------------------------------------------------------------------------
+# Voice input: speak a prompt, or transcribe voice notes
+# --------------------------------------------------------------------------
+# cell stays stdlib-only. Recording shells out to parecord / arecord /
+# pw-record (raw 16 kHz mono PCM on stdout). Local transcription runs
+# faster-whisper inside its own venv (~/.config/cell/voice/venv) through a
+# tiny driver sent on stdin; the api engine posts to any OpenAI-compatible
+# /audio/transcriptions endpoint with urllib. Nothing here touches a project.
+
+VOICE_DEFAULTS = {
+    "engine": "local",            # local (faster-whisper) | api (OpenAI-compatible endpoint)
+    "model": "small",             # tiny, base, small, medium, large-v3, turbo, or a HF repo id
+    "python": "",                 # interpreter that has faster_whisper; "" = cell's own venv
+    "language": "",               # "" = auto-detect, else ISO code: en, hi, de, …
+    "beam": 1,                    # 1 = fastest; 5 = faster-whisper's default (slower, a bit better)
+    "device": "cpu",              # cpu | cuda
+    "compute": "int8",            # int8 on cpu, float16 on cuda
+    "silence_seconds": 1.5,       # listen: stop after this much quiet once speech was heard
+    "max_seconds": 60,            # listen: hard cap
+    "recorder": "auto",           # auto | command writing s16le 16 kHz mono PCM to stdout
+    "api_url": "https://api.openai.com/v1",
+    "api_model": "whisper-1",
+    "api_key_env": "OPENAI_API_KEY",
+}
+VOICE_RATE = 16000
+VOICE_CHUNK = VOICE_RATE // 10 * 2        # 100 ms of s16 mono
+VOICE_PIP = ["faster-whisper", "av<19"]   # PyAV 19 broke faster-whisper's audio decoding (metadata_errors)
+
+WHISPER_DRIVER = r'''
+import json, os, sys
+a = json.loads(sys.argv[1])
+os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+try:
+    from faster_whisper import WhisperModel
+except ImportError:
+    print(json.dumps({"error": "faster_whisper is not installed in " + sys.executable}))
+    sys.exit(2)
+m = WhisperModel(a["model"], device=a["device"], compute_type=a["compute"], download_root=a["models"])
+if a.get("warm"):
+    print(json.dumps({"ok": True}))
+    sys.exit(0)
+segs, info = m.transcribe(a["file"], vad_filter=True, beam_size=int(a["beam"]), language=a.get("language") or None)
+text = " ".join(s.text.strip() for s in segs if s.text.strip())
+print(json.dumps({"text": text, "language": info.language, "duration": round(info.duration, 1)}))
+'''
+
+VOICE_SKILL = '''---
+name: voice
+description: Voice input through cell. Use when the user types /voice, asks you to listen, wants to speak instead of typing, or gives an audio or voice-note file (.ogg .opus .m4a .mp3 .wav .webm .flac) to transcribe, understand or act on.
+---
+
+# Voice input (cell voice)
+
+Both commands print the transcript on stdout; status goes to stderr.
+
+- **Spoken prompt:** run `cell voice listen` immediately, without asking first. It records from the microphone until the speaker pauses for about 1.5 s (60 s max). Treat the transcript as the user's message: quote it back in one short line, then act on it.
+- **Voice file:** run `cell voice transcribe <file>` (several files: all in one command). Quote the transcript in one line, then act on it.
+- Options: `--language xx` forces a language (default auto-detect); `--seconds N` records a fixed length.
+
+If the output says the microphone captured only silence, tell the user the mic is not reaching the system (in a VM: enable audio input in the VM settings) and offer to transcribe a voice file instead. If it says voice is not set up, tell them to run `cell voice setup`.
+'''
+
+
+def voice_dir() -> Path:
+    return config_dir() / "voice"
+
+
+def voice_cfg(cfg) -> dict:
+    vc = dict(VOICE_DEFAULTS)
+    vc.update({k: v for k, v in (cfg.get("voice") or {}).items() if v is not None})
+    return vc
+
+
+def voice_python(vc) -> Path:
+    if vc.get("python"):
+        return Path(vc["python"]).expanduser()
+    return voice_dir() / "venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+
+
+def voice_api_key(cfg, vc):
+    return os.environ.get(vc.get("api_key_env") or "") or cfg.get("keys", {}).get("voice")
+
+
+def find_recorder(vc):
+    """Command that writes raw s16le 16 kHz mono PCM to stdout, and its name."""
+    custom = (vc.get("recorder") or "auto").strip()
+    if custom and custom != "auto":
+        return shlex.split(custom), custom.split()[0]
+    if which("parecord"):
+        return ["parecord", "--raw", "--format=s16le", f"--rate={VOICE_RATE}", "--channels=1"], "parecord"
+    if which("arecord"):
+        return ["arecord", "-q", "-t", "raw", "-f", "S16_LE", "-r", str(VOICE_RATE), "-c", "1", "-"], "arecord"
+    if which("pw-record"):
+        return ["pw-record", "--rate", str(VOICE_RATE), "--channels", "1", "--format", "s16", "-"], "pw-record"
+    if which("ffmpeg"):
+        return ["ffmpeg", "-v", "quiet", "-f", "pulse", "-i", "default", "-ac", "1",
+                "-ar", str(VOICE_RATE), "-f", "s16le", "-"], "ffmpeg"
+    return None, None
+
+
+def _level(chunk: bytes):
+    a = array.array("h", chunk[: len(chunk) - len(chunk) % 2])
+    if not a:
+        return 0.0, 0
+    return math.sqrt(sum(x * x for x in a) / len(a)), max(abs(x) for x in a)
+
+
+def record_audio(vc, seconds=None, quiet=False):
+    """Record the microphone to voice/last.wav. Stops after a fixed length,
+    on Enter (when run from a terminal), or after `silence_seconds` of quiet
+    once speech was heard. Returns (path, duration, peak)."""
+    cmd, name = find_recorder(vc)
+    if not cmd:
+        raise CellError("no recorder found: install pulseaudio-utils (parecord), alsa-utils (arecord) or "
+                        "pipewire (pw-record), or set [voice] recorder = \"<command writing s16le 16kHz mono PCM to stdout>\"")
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
+    except OSError as e:
+        raise CellError(f"cannot start recorder {name}: {e}")
+    silence = float(vc["silence_seconds"])
+    max_s = float(seconds or vc["max_seconds"])
+    tty = sys.stdin.isatty() and seconds is None
+    status = sys.stderr.isatty() and not quiet
+    frames, floor, thr, started, last_voice, peak = [], None, 0.0, False, 0.0, 0
+    if status:
+        how = (f"speak, pause {silence:g}s" + (" or press Enter" if tty else "") + " to stop") if seconds is None \
+            else f"recording {max_s:g}s"
+        sys.stderr.write(f"● listening via {name} — {how}\n")
+    try:
+        while True:
+            chunk = proc.stdout.read(VOICE_CHUNK)
+            if not chunk:
+                break
+            frames.append(chunk)
+            now = len(frames) * VOICE_CHUNK / (VOICE_RATE * 2)      # audio time, not wall time
+            rms, pk = _level(chunk)
+            peak = max(peak, pk)
+            speaking = False
+            if seconds is None:
+                if floor is None and now >= 0.5:
+                    floor = max(1.0, sum(_level(c)[0] for c in frames) / len(frames))
+                    thr = max(floor * 3, 250.0)
+                if floor is not None:
+                    speaking = rms >= thr
+                    if speaking:
+                        started, last_voice = True, now
+                    elif started and now - last_voice >= silence:
+                        break
+            if status:
+                bar = "▮" * min(20, int(rms / 150))
+                state = "speaking" if speaking else ("…" if started else "waiting")
+                sys.stderr.write(f"\r  {now:5.1f}s {bar:<20} {state}   ")
+                sys.stderr.flush()
+            if now >= max_s:
+                break
+            if tty and select.select([sys.stdin], [], [], 0)[0]:
+                sys.stdin.readline()
+                break
+    except KeyboardInterrupt:
+        pass
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        if status:
+            sys.stderr.write("\r" + " " * 60 + "\r")
+            sys.stderr.flush()
+    data = b"".join(frames)
+    duration = len(data) / (VOICE_RATE * 2)
+    if duration < 0.3:
+        raise CellError(f"recorder {name} produced no audio")
+    if peak == 0:
+        raise CellError("the microphone captured only silence (level 0). Check the input device "
+                        "(pactl list sources short); in a VM, enable audio input in the VM's settings")
+    voice_dir().mkdir(parents=True, exist_ok=True)
+    path = voice_dir() / "last.wav"
+    with wave.open(str(path), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(VOICE_RATE)
+        w.writeframes(data)
+    return path, duration, peak
+
+
+def transcribe_file(cfg, path, language=None, quiet=False) -> dict:
+    """-> {"text", "language", "duration"} via the configured engine."""
+    if not cfg.get("voice"):
+        raise CellError("voice is not set up yet: run 'cell voice setup'")
+    vc = voice_cfg(cfg)
+    path = Path(path).expanduser()
+    if not path.is_file():
+        raise CellError(f"no such audio file: {path}")
+    lang = language if language is not None else (vc.get("language") or "")
+    if vc["engine"] == "api":
+        return _transcribe_api(cfg, vc, path, lang)
+    return _transcribe_local(vc, path, lang, quiet)
+
+
+def _transcribe_local(vc, path: Path, lang: str, quiet=False) -> dict:
+    py = voice_python(vc)
+    if not py.exists():
+        raise CellError(f"{py} not found: run 'cell voice setup'")
+    args = {"model": vc["model"], "device": vc["device"], "compute": vc["compute"], "beam": vc["beam"],
+            "models": str(voice_dir() / "models"), "file": str(path), "language": lang}
+    show = sys.stderr.isatty() and not quiet
+    if show:
+        sys.stderr.write(f"transcribing ({vc['model']}) …\r")
+        sys.stderr.flush()
+    r = subprocess.run([str(py), "-", json.dumps(args)], input=WHISPER_DRIVER, capture_output=True, text=True)
+    if show:
+        sys.stderr.write(" " * 40 + "\r")
+        sys.stderr.flush()
+    lines = (r.stdout or "").strip().splitlines()
+    try:
+        res = json.loads(lines[-1]) if lines else {}
+    except json.JSONDecodeError:
+        res = {}
+    if r.returncode != 0 or "text" not in res:
+        err = res.get("error") or ((r.stderr or "").strip().splitlines() or ["unknown error"])[-1]
+        raise CellError(f"transcription failed: {err}")
+    return res
+
+
+def _transcribe_api(cfg, vc, path: Path, lang: str) -> dict:
+    key = voice_api_key(cfg, vc)
+    if not key:
+        raise CellError(f"no key for the voice API: export {vc['api_key_env']} or 'cell keys set voice'")
+    boundary = "----cell" + uuid.uuid4().hex
+    fields = {"model": vc["api_model"], "response_format": "json"}
+    if lang:
+        fields["language"] = lang
+    body = bytearray()
+    for k, v in fields.items():
+        body += f'--{boundary}\r\nContent-Disposition: form-data; name="{k}"\r\n\r\n{v}\r\n'.encode()
+    body += (f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="{path.name}"\r\n'
+             f"Content-Type: application/octet-stream\r\n\r\n").encode() + path.read_bytes() + b"\r\n"
+    body += f"--{boundary}--\r\n".encode()
+    req = urllib.request.Request(
+        vc["api_url"].rstrip("/") + "/audio/transcriptions", data=bytes(body), method="POST",
+        headers={"Authorization": f"Bearer {key}", "Content-Type": f"multipart/form-data; boundary={boundary}"})
+    try:
+        with urllib.request.urlopen(req, timeout=180) as resp:
+            res = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        raise CellError(f"voice API {e.code}: {e.read().decode('utf-8', 'replace')[:300]}")
+    except (urllib.error.URLError, OSError, json.JSONDecodeError) as e:
+        raise CellError(f"voice API request failed: {e}")
+    return {"text": (res.get("text") or "").strip(), "language": res.get("language") or lang or "?",
+            "duration": res.get("duration")}
+
+
+def voice_capture_text(cfg, seconds=None, language=None, quiet=False) -> str:
+    """Record, transcribe, return the text (what 'cell voice listen' and
+    'cell run --voice' share)."""
+    if not cfg.get("voice"):
+        raise CellError("voice is not set up yet: run 'cell voice setup'")
+    path, duration, _ = record_audio(voice_cfg(cfg), seconds=seconds, quiet=quiet)
+    if not quiet and sys.stderr.isatty():
+        sys.stderr.write(f"recorded {duration:.1f}s\n")
+    res = transcribe_file(cfg, path, language=language, quiet=quiet)
+    if not res["text"]:
+        raise CellError(f"no speech recognized in {duration:.1f}s of audio (saved: {path})")
+    return res["text"]
+
+
+def _copy_clipboard(text: str):
+    for cmd in (["wl-copy"], ["xclip", "-selection", "clipboard"], ["pbcopy"], ["clip"]):
+        if which(cmd[0]):
+            subprocess.run(cmd, input=text.encode("utf-8"))
+            return True
+    warn("no clipboard tool found (wl-copy, xclip, pbcopy)")
+    return False
+
+
+def write_voice_skill() -> Path:
+    p = seed_dir("claude") / "skills" / "voice" / "SKILL.md"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(VOICE_SKILL, encoding="utf-8")
+    return p
+
+
+def voice_setup(args, cfg):
+    vc = voice_cfg(cfg)
+    for k in ("engine", "model", "python", "language", "recorder", "api_url", "api_model", "api_key_env"):
+        v = getattr(args, k, None)
+        if v is not None:
+            vc[k] = v
+    print(f"── {APP} voice setup ──")
+    vdir = voice_dir()
+    vdir.mkdir(parents=True, exist_ok=True)
+    if vc["engine"] == "local":
+        py = voice_python(vc)
+        if not py.exists():
+            if vc["python"]:
+                raise CellError(f"{py} not found")
+            venv = vdir / "venv"
+            print(f"venv    creating {venv} …")
+            sys.stdout.flush()
+            r = subprocess.run([sys.executable, "-m", "venv", str(venv)], capture_output=True, text=True)
+            if r.returncode:
+                raise CellError(f"python -m venv failed: {r.stderr.strip()[-300:]}\n"
+                                f"(Debian/Ubuntu: sudo apt install python3-venv)")
+        if subprocess.run([str(py), "-c", "import faster_whisper"], capture_output=True).returncode:
+            print("engine  installing faster-whisper (one time, ~150 MB) …")
+            sys.stdout.flush()
+            r = subprocess.run([str(py), "-m", "pip", "install", "-q", "--disable-pip-version-check"] + VOICE_PIP)
+            if r.returncode:
+                raise CellError("pip install faster-whisper failed (see above)")
+        print(f"engine  local faster-whisper via {py}")
+        print(f"model   {vc['model']}: checking / downloading …")
+        sys.stdout.flush()
+        a = {"model": vc["model"], "device": vc["device"], "compute": vc["compute"],
+             "models": str(vdir / "models"), "warm": True}
+        r = subprocess.run([str(py), "-", json.dumps(a)], input=WHISPER_DRIVER, capture_output=True, text=True)
+        if r.returncode:
+            err = ((r.stderr or "").strip().splitlines() or [r.stdout.strip() or "unknown error"])[-1]
+            raise CellError(f"could not load model '{vc['model']}': {err}")
+        print(f"model   {vc['model']} ready in {vdir / 'models'}")
+        _voice_smoke_test(vc, py)
+    else:
+        key = voice_api_key(cfg, vc)
+        print(f"engine  api {vc['api_url']}  model {vc['api_model']}  "
+              f"key: {'found' if key else 'MISSING (export ' + vc['api_key_env'] + ' or: cell keys set voice)'}")
+    _, name = find_recorder(vc)
+    print(f"mic     recorder: {name or 'NONE (install pulseaudio-utils, alsa-utils or pipewire)'}")
+    cfg["voice"] = {k: vc[k] for k in VOICE_DEFAULTS}
+    save_config(cfg)
+    print(f"config  [voice] saved in {config_path()}")
+    print(f"skill   {write_voice_skill()}")
+    print("        every claude env gets /voice on its next 'cell run'")
+    print("\ntry:    cell voice listen            cell voice transcribe note.ogg            cell run max --voice")
+
+
+def _voice_smoke_test(vc, py: Path):
+    """Decode + transcribe half a second of noise so a broken dependency
+    (e.g. a PyAV release faster-whisper can't use) shows up at setup time."""
+    probe = voice_dir() / "probe.wav"
+    with wave.open(str(probe), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(VOICE_RATE)
+        w.writeframes(array.array("h", [((i * 7919) % 200) - 100 for i in range(VOICE_RATE // 2)]).tobytes())
+    try:
+        _transcribe_local(vc, probe, "", quiet=True)
+        print("check   decode + transcribe ok")
+    except CellError as e:
+        if "metadata_errors" in str(e) or " av" in str(e) or "av." in str(e):
+            print("check   audio decoding broken by a newer PyAV — repinning …")
+            subprocess.run([str(py), "-m", "pip", "install", "-q", "--disable-pip-version-check", "av<19"])
+            _transcribe_local(vc, probe, "", quiet=True)
+            print("check   decode + transcribe ok")
+        else:
+            raise
+    finally:
+        probe.unlink(missing_ok=True)
+
+
+def cmd_voice(args, cfg):
+    if args.action == "setup":
+        return voice_setup(args, cfg)
+    if args.action == "listen":
+        text = voice_capture_text(cfg, seconds=args.seconds, language=args.language, quiet=args.quiet)
+        print(json.dumps({"text": text}, ensure_ascii=False) if args.json else text)
+        if args.copy:
+            _copy_clipboard(text)
+        return
+    if args.action == "transcribe":
+        if not args.files:
+            raise CellError("file(s) required: cell voice transcribe FILE…")
+        results = []
+        for f in args.files:
+            res = transcribe_file(cfg, f, language=args.language, quiet=args.quiet)
+            results.append({"file": str(f), **res})
+        if args.json:
+            print(json.dumps(results if len(results) > 1 else results[0], ensure_ascii=False, indent=2))
+        else:
+            for r in results:
+                if len(results) > 1:
+                    print(f"== {r['file']}  ({r.get('language')}, {r.get('duration')}s)")
+                print(r["text"])
+        if args.copy:
+            _copy_clipboard("\n\n".join(r["text"] for r in results))
+
+
+# --------------------------------------------------------------------------
+# Interactive menu
+# --------------------------------------------------------------------------
+
+def interactive(cfg):
+    while True:
+        cfg = load_config()
+        print(f"\n── {APP} v{VERSION} ─────────────────────────────── {Path.cwd()}")
+        bps = sorted(cfg.get("blueprints", {}).items())
+        here = {i["name"] for i in find_instances(Path.cwd(), get_runtimes(cfg))}
+        if not bps:
+            print("  (no blueprints yet — press a)")
+        for i, (name, bp) in enumerate(bps, 1):
+            mark = "•" if name in here else " "
+            print(f"  {i} {mark} {name:<14} {bp.get('runtime','')}/{bp.get('provider','')}/{bp.get('model','')}")
+        print("\n  <n> run    s show    a add    e edit    d delete")
+        print("  p providers    k keys    o doctor    q quit")
+        try:
+            choice = input("\n> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+        try:
+            if choice in ("q", ""):
+                return
+            elif choice == "a":
+                name = ask("name")
+                if name:
+                    cmd_add(argparse.Namespace(name=name, runtime=None, provider=None, model=None,
+                                               api_key=None, api_key_env=None, login=False,
+                                               persona=None, permissions=None, force=False), cfg)
+            elif choice in ("e", "d", "s") or choice.isdigit():
+                if choice.isdigit():
+                    idx, action = int(choice), "run"
+                else:
+                    action = choice
+                    idx = ask(f"blueprint number to {dict(e='edit', d='delete', s='show')[action]}")
+                    idx = int(idx) if idx.isdigit() else 0
+                if not 1 <= idx <= len(bps):
+                    print("no such blueprint")
+                    continue
+                name = bps[idx - 1][0]
+                if action == "run":
+                    cmd_run(argparse.Namespace(name=name, resume=None, cont=False, prompt=None,
+                                               model=None, api_key=None, extra=None), cfg)
+                elif action == "show":
+                    cmd_show(argparse.Namespace(name=name, resume=None, cont=False, prompt=None,
+                                                model=None, api_key=None, extra=None), cfg)
+                elif action == "delete":
+                    if confirm(f"Delete blueprint '{name}'?"):
+                        cmd_remove(argparse.Namespace(name=name), cfg)
+                elif action == "edit":
+                    print("fields: model, provider, persona, permissions (blank to stop)")
+                    ns = argparse.Namespace(name=name, runtime=None, provider=None, model=None,
+                                            api_key=None, api_key_env=None, login=False, persona=None,
+                                            permissions=None, no_hooks=None, hooks=None)
+                    while True:
+                        field = ask("field")
+                        if field not in ("model", "provider", "persona", "permissions"):
+                            break
+                        setattr(ns, field, ask(f"new {field}"))
+                    cmd_edit(ns, cfg)
+            elif choice == "p":
+                cmd_provider(argparse.Namespace(action="list", name=None), cfg)
+            elif choice == "k":
+                cmd_keys(argparse.Namespace(action="list", provider=None, key=None), cfg)
+            elif choice == "o":
+                cmd_doctor(None, cfg)
+            else:
+                print("?")
+        except CellError as e:
+            print(f"error: {e}")
+
+
+# --------------------------------------------------------------------------
+# Argument parsing
+# --------------------------------------------------------------------------
+
+EPILOG = """
+examples:
+  cell add max --runtime claude --provider anthropic --model opus --login
+  cell add glm --runtime claude --provider zai --model glm-5.3 && cell keys set zai
+  cell provider add myproxy --base-url http://localhost:4000 --key-env MYPROXY_KEY
+  cell run max                 # in a project dir: creates ./.claude-env-max/ and launches
+  cell run glm -p "explain this repo"
+  cell show glm                # dry-run: files, env and command, secrets masked
+  cell import                  # bring your helo blueprints over
+"""
+
+
+def build_parser():
+    p = argparse.ArgumentParser(prog=APP, description=__doc__, epilog=EPILOG, allow_abbrev=False,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--version", action="version", version=f"{APP} {VERSION}")
+    sub = p.add_subparsers(dest="cmd", metavar="<command>")
+
+    sp = sub.add_parser("add", help="create a blueprint (an agent identity)")
+    sp.add_argument("name")
+    sp.add_argument("--runtime", help="claude, kimi, or one added with 'cell runtime add'")
+    sp.add_argument("--provider", help="LLM subscription: see 'cell provider list'")
+    sp.add_argument("--model", help="model id or alias, e.g. opus, glm-5.3, kimi-code/k3")
+    sp.add_argument("--api-key", help="key stored in the blueprint (prefer 'cell keys set' or --api-key-env)")
+    sp.add_argument("--api-key-env", metavar="VAR", help="read the key from this env var at launch (never stored)")
+    sp.add_argument("--login", action="store_true", help="no key: the runtime signs in with your subscription")
+    sp.add_argument("--persona", help="template name (cell templates list) or a file path")
+    sp.add_argument("--permissions", choices=PERMISSION_NAMES, help="bypass = never ask (claude: bypassPermissions, kimi: --auto)")
+    sp.add_argument("--force", action="store_true", help="replace an existing blueprint")
+
+    sp = sub.add_parser("edit", help="change blueprint fields ('' clears a field)")
+    sp.add_argument("name")
+    sp.add_argument("--runtime")
+    sp.add_argument("--provider")
+    sp.add_argument("--model")
+    sp.add_argument("--api-key")
+    sp.add_argument("--api-key-env", metavar="VAR")
+    sp.add_argument("--login", action="store_true")
+    sp.add_argument("--persona")
+    sp.add_argument("--permissions", help=f"one of {', '.join(PERMISSION_NAMES)} or ''")
+    sp.add_argument("--no-hooks", nargs="*", metavar="EVENT", default=None, help="disable hooks (all, or the named events)")
+    sp.add_argument("--hooks", nargs="*", metavar="EVENT", default=None, help="enable hooks (all, or the named events)")
+
+    sub.add_parser("list", help="list blueprints")
+    sp = sub.add_parser("remove", help="delete a blueprint (instance dirs stay)")
+    sp.add_argument("name")
+
+    for verb, help_ in (("run", "launch an agent in this project"),
+                        ("show", "dry-run: what 'run' would do, secrets masked")):
+        sp = sub.add_parser(verb, help=help_)
+        sp.add_argument("name", nargs="?", help="blueprint (optional when only one applies here)")
+        sp.add_argument("-r", "--resume", nargs="?", const=True, default=None, metavar="ID",
+                        help="resume a session (no ID: the runtime's picker)")
+        sp.add_argument("-c", "--continue", dest="cont", action="store_true", help="continue the most recent session")
+        sp.add_argument("-p", "--prompt", help="one-shot prompt, then exit")
+        sp.add_argument("--model", help="model for this launch only")
+        sp.add_argument("--api-key", help="key for this launch only")
+        sp.add_argument("--voice", action="store_true", help="speak the opening prompt first (cell voice listen)")
+
+    sub.add_parser("status", help="config path, runtimes, instances here")
+    sub.add_parser("doctor", help="health check: config, runtimes, keys, instances, git")
+
+    sp = sub.add_parser("keys", help="global API keys, one per provider")
+    sp.add_argument("action", choices=["set", "list", "remove"])
+    sp.add_argument("provider", nargs="?")
+    sp.add_argument("key", nargs="?", help="omit to be prompted (keeps it out of shell history)")
+
+    sp = sub.add_parser("key", help="set a per-blueprint key")
+    sp.add_argument("name")
+    sp.add_argument("key", nargs="?", help="omit to be prompted")
+
+    sp = sub.add_parser("provider", help="LLM subscriptions: list, add, show, remove",
+                        description="A provider is an LLM subscription or API account. Built-ins: "
+                                    + ", ".join(sorted(DEFAULT_PROVIDERS)) + ". Any Anthropic-compatible "
+                                    "endpoint works with the claude runtime: cell provider add NAME --base-url URL.")
+    sp.add_argument("action", choices=["list", "add", "show", "remove"])
+    sp.add_argument("name", nargs="?")
+    sp.add_argument("--base-url", help="Anthropic-compatible endpoint (…/anthropic, a proxy, http://localhost:11434)")
+    sp.add_argument("--key-env", metavar="VAR", help="env var holding the key (default NAME_API_KEY)")
+    sp.add_argument("--auth", choices=["token", "api-key"], help="token -> ANTHROPIC_AUTH_TOKEN (default), api-key -> ANTHROPIC_API_KEY")
+    sp.add_argument("--token", help="fixed placeholder token (e.g. ollama)")
+    sp.add_argument("--tier", action="append", metavar="TIER=MODEL", help="model for an alias: opus/sonnet/haiku/fable (repeatable)")
+    sp.add_argument("--env", action="append", metavar="K=V", help="extra env var for this provider (repeatable)")
+    sp.add_argument("--kimi-catalog", metavar="ID", help="models.dev id for the kimi runtime (kimi provider catalog list)")
+    sp.add_argument("--default-model", help="model suggested in guided 'cell add'")
+    sp.add_argument("--login", action="store_true", help="the runtime can sign in to this provider itself")
+    sp.add_argument("--note")
+    sp.add_argument("--docs")
+    sp.add_argument("--force", action="store_true")
+
+    sp = sub.add_parser("runtime", help="AI CLIs: list, add, install, remove",
+                        description="Add ANY CLI as a runtime. Flag values that start with '-' "
+                                    "must use the = form, e.g. --model-flag=--model --prompt-flag=-p",
+                        allow_abbrev=False)
+    sp.add_argument("action", choices=["list", "add", "install", "remove"])
+    sp.add_argument("name", nargs="?")
+    sp.add_argument("--binary")
+    sp.add_argument("--env-var", help="env var that relocates the CLI's config dir")
+    sp.add_argument("--prompt-flag")
+    sp.add_argument("--resume-flag")
+    sp.add_argument("--continue-flag")
+    sp.add_argument("--model-flag")
+    sp.add_argument("--model-mode", choices=["flag", "settings"])
+    sp.add_argument("--config", choices=["none", "claude"], help="claude = cell manages settings.json in the env dir")
+    sp.add_argument("--persona-file")
+    sp.add_argument("--global-dir")
+    sp.add_argument("--install-unix")
+    sp.add_argument("--install-windows")
+    sp.add_argument("--force", action="store_true")
+    sp.add_argument("-y", "--yes", action="store_true")
+
+    sp = sub.add_parser("hooks", help="claude hooks applied to every env: list, set, remove, import")
+    sp.add_argument("action", choices=["list", "set", "remove", "import"])
+    sp.add_argument("event", nargs="?", help="stop, user_prompt_submit, post_compact, … (import: env dir)")
+    sp.add_argument("command", nargs="?")
+
+    sp = sub.add_parser("templates", help="persona templates")
+    sp.add_argument("action", choices=["list", "show"])
+    sp.add_argument("name", nargs="?")
+
+    sp = sub.add_parser("sessions", help="conversation sessions in this project")
+    sp.add_argument("name", nargs="?")
+    sp.add_argument("-n", "--limit", type=int, default=10)
+
+    sp = sub.add_parser("clean", help="remove instance dirs from this project")
+    sp.add_argument("name", nargs="?")
+    sp.add_argument("--global", dest="global_runtime", metavar="RUNTIME", help="remove the runtime's GLOBAL dir (e.g. ~/.claude)")
+    sp.add_argument("-y", "--yes", action="store_true")
+
+    sp = sub.add_parser("voice", help="voice input: setup, listen (speak a prompt), transcribe FILE…",
+                        description="Speak prompts or transcribe voice notes. local engine = faster-whisper in "
+                                    "cell's own venv (private, offline); api engine = any OpenAI-compatible "
+                                    "/audio/transcriptions endpoint (OpenAI, Groq, …) with a key.")
+    sp.add_argument("action", choices=["setup", "listen", "transcribe"])
+    sp.add_argument("files", nargs="*", help="transcribe: audio files (ogg/opus, m4a, mp3, wav, webm, flac, …)")
+    sp.add_argument("-s", "--seconds", type=float, help="listen: fixed length instead of stop-on-silence")
+    sp.add_argument("-l", "--language", help="ISO code: en, hi, de, … (default: auto-detect)")
+    sp.add_argument("--json", action="store_true")
+    sp.add_argument("--copy", action="store_true", help="also copy the text to the clipboard")
+    sp.add_argument("-q", "--quiet", action="store_true", help="no status output on stderr")
+    g = sp.add_argument_group("setup options")
+    g.add_argument("--engine", choices=["local", "api"])
+    g.add_argument("--model", help="local model: tiny, base, small (default), medium, large-v3, turbo")
+    g.add_argument("--python", help="interpreter that already has faster_whisper (default: cell's own venv)")
+    g.add_argument("--recorder", help="command writing s16le 16 kHz mono PCM to stdout (default: parecord/arecord/pw-record)")
+    g.add_argument("--api-url", help="OpenAI-compatible base URL, e.g. https://api.groq.com/openai/v1")
+    g.add_argument("--api-model", help="e.g. whisper-1, gpt-4o-mini-transcribe, whisper-large-v3-turbo")
+    g.add_argument("--api-key-env", metavar="VAR", help="env var holding the key (or: cell keys set voice)")
+
+    sp = sub.add_parser("import", help="import helo blueprints (~/.config/helo/config.toml and .helo.toml files)")
+    sp.add_argument("dir", nargs="?", help="directory to scan for .helo.toml instance files")
+    sp.add_argument("--config", help="path to a helo config.toml (default ~/.config/helo/config.toml)")
+    sp.add_argument("--recursive", action="store_true")
+    sp.add_argument("--force", action="store_true", help="overwrite blueprints that already exist")
+    sp.add_argument("--dry-run", action="store_true")
+
+    sub.add_parser("init", help="first-time setup")
+    return p
+
+
+COMMANDS = {
+    "add": cmd_add, "edit": cmd_edit, "list": cmd_list, "remove": cmd_remove,
+    "run": cmd_run, "show": cmd_show, "status": cmd_status, "doctor": cmd_doctor,
+    "keys": cmd_keys, "key": cmd_key, "provider": cmd_provider, "runtime": cmd_runtime,
+    "hooks": cmd_hooks, "templates": cmd_templates, "sessions": cmd_sessions,
+    "clean": cmd_clean, "import": cmd_import, "init": cmd_init, "voice": cmd_voice,
+}
+
+
+def main():
+    p = build_parser()
+    argv = sys.argv[1:]
+    extra = None
+    if "--" in argv:                       # everything after -- goes to the runtime untouched
+        i = argv.index("--")
+        argv, extra = argv[:i], argv[i + 1:]
+    args, unknown = p.parse_known_args(argv)
+    if args.cmd == "voice":                # 'transcribe --json FILE': argparse leaves FILE unparsed
+        args.files = list(args.files or []) + [u for u in (unknown or []) if not u.startswith("-")]
+        unknown = [u for u in (unknown or []) if u.startswith("-")]
+    if args.cmd in ("run", "show"):
+        extra = (unknown or []) + (extra or [])   # unknown flags pass through too
+    elif unknown or extra:
+        p.error(f"unrecognized arguments: {' '.join((unknown or []) + (extra or []))}")
+    args.extra = extra or None
+
+    cfg = load_config()
+    if args.cmd is None:
+        if not tty():
+            p.print_help()
+            return 0
+        interactive(cfg)
+        return 0
+    return COMMANDS[args.cmd](args, cfg) or 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except CellError as e:
+        print(f"error: {e}", file=sys.stderr)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print()
+        sys.exit(130)
