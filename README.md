@@ -160,7 +160,7 @@ cell hooks [list|set|remove|import]
 cell templates [list|show]           personas: coding, assistant, devops + ~/.config/cell/templates/*.md
 cell voice [setup|listen|transcribe FILE…]   speak prompts, transcribe voice notes (local or API)
 cell sessions [n] [--all] [-n N]     sessions in this folder with titles; type a number to open
-cell learn [on|off|now|remove N|log]  self-improving instructions from your corrections
+cell learn [on|off|now|add RULE|remove N|log]  self-improving instructions from your corrections
 cell clean [n] [-y] [--global RUNTIME]
 cell import [dir] [--config helo.toml] [--recursive] [--force] [--dry-run]
 ```
@@ -222,6 +222,7 @@ launch.
 cell learn on        # turn it on (needs a claude blueprint with a persona file)
 cell learn           # rules learned so far, each with the words of yours that prompted it
 cell learn remove 2  # drop one
+cell learn add "Never push without asking."   # add your own
 cell learn now       # analyse the latest session in this folder right away
 cell learn log       # what happened after each session
 cell learn off

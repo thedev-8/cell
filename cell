@@ -2856,6 +2856,20 @@ def cmd_learn(args, cfg):
         p = learn_dir() / "learn.log"
         print("\n".join(p.read_text(encoding="utf-8").splitlines()[-40:]) if p.exists() else "no log yet")
         return
+    if action == "add":
+        text = " ".join([args.target or ""] + list(args.more or [])).strip().lstrip("-• ").strip()
+        if len(text) < 8:
+            raise CellError('usage: cell learn add "Always show the exact command to run."')
+        if text.lower() in {r["text"].lower() for r in state["rules"]}:
+            raise CellError("that rule is already there (cell learn)")
+        if len(state["rules"]) >= LEARN_MAX_RULES:
+            raise CellError(f"{LEARN_MAX_RULES} rules already; remove one first (cell learn remove N)")
+        state["rules"].append({"text": text, "date": datetime.date.today().isoformat(),
+                               "project": str(Path.cwd()), "session": "manual"})
+        save_learn_state(state)
+        write_learned_block(cfg, state["rules"])
+        print(f"added rule {len(state['rules'])}: {text}")
+        return
     if action == "remove":
         nums = [n for n in (args.target or "").replace(",", " ").split() if n] + list(args.more or [])
         if not nums or not all(n.isdigit() and 1 <= int(n) <= len(state["rules"]) for n in nums):
@@ -3141,9 +3155,9 @@ def build_parser():
                         description="When a claude session ends, cell asks claude (headless, same login) which "
                                     "corrections or lasting preferences you expressed, and adds short rules to "
                                     "the blueprint's persona CLAUDE.md.")
-    sp.add_argument("action", nargs="?", choices=["list", "on", "off", "now", "remove", "log", "hook", "run"],
-                    help="list (default) | on | off | now [NAME] | remove N… | log")
-    sp.add_argument("target", nargs="?", help="now: blueprint; remove: rule number(s)")
+    sp.add_argument("action", nargs="?", choices=["list", "on", "off", "now", "add", "remove", "log", "hook", "run"],
+                    help="list (default) | on | off | now [NAME] | add \"RULE\" | remove N… | log")
+    sp.add_argument("target", nargs="?", help="now: blueprint; add: the rule; remove: rule number(s)")
     sp.add_argument("more", nargs="*", help=argparse.SUPPRESS)
     sp.add_argument("--env-dir", help=argparse.SUPPRESS)
     sp.add_argument("--project", help=argparse.SUPPRESS)
