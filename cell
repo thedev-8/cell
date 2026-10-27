@@ -1063,17 +1063,27 @@ def cmd_remove(args, cfg):
 
 
 def _pick_blueprint(args, cfg) -> str:
-    if args.name:
-        return args.name
     bps = sorted(cfg.get("blueprints", {}))
     if not bps:
         raise CellError("no blueprints defined. Use 'cell add' first.")
-    here = {i["name"] for i in find_instances(Path.cwd(), get_runtimes(cfg))} & set(bps)
+    resume = getattr(args, "resume", None)
+    if not args.name and isinstance(resume, str) and resume in bps:
+        # `cell run -r max`: -r takes an optional session ID and swallowed the name
+        args.name, args.resume = resume, True
+    if args.name:
+        if args.name not in bps:
+            raise CellError(f"no blueprint '{args.name}'. Known: {', '.join(bps)}")
+        return args.name
+    here = sorted({i["name"] for i in find_instances(Path.cwd(), get_runtimes(cfg))} & set(bps))
     if len(here) == 1:
-        return next(iter(here))
+        return here[0]
     if len(bps) == 1:
         return bps[0]
-    raise CellError(f"which blueprint? {', '.join(bps)}")
+    verb = getattr(args, "cmd", None) or "run"
+    pool = here or bps
+    hint = "each has an env dir here" if here else "no env dir here yet"
+    raise CellError(f"which blueprint? {', '.join(pool)} ({hint}). "
+                    f"Put the name first: cell {verb} {pool[0]} [-r|-c|-p ...]")
 
 
 def _print_plan(plan, cmd, env, fresh_note=True):
