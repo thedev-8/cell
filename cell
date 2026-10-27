@@ -30,7 +30,9 @@ if sys.version_info < (3, 11):
 
 import argparse
 import datetime
+import difflib
 import getpass
+import glob
 import json
 import os
 import re
@@ -42,7 +44,6 @@ import array
 import math
 import select
 import shlex
-import time
 import urllib.error
 import urllib.request
 import uuid
@@ -50,7 +51,7 @@ import wave
 from pathlib import Path
 
 APP = "cell"
-VERSION = "2.1.0"
+VERSION = "2.2.0"
 
 
 class CellError(Exception):
@@ -385,12 +386,27 @@ def get_providers(cfg: dict) -> dict:
     return _merge(DEFAULT_PROVIDERS, cfg.get("providers", {}))
 
 
+def suggest(word, options) -> str:
+    """' Did you mean 'x'?' for a near miss, else ''."""
+    m = difflib.get_close_matches((word or "").lower(), sorted(options), n=1, cutoff=0.6)
+    return f" Did you mean '{m[0]}'?" if m else ""
+
+
+def resolve_blueprint(cfg: dict, name) -> str:
+    """The blueprint's real name: exact, else case-insensitive (MAX -> max).
+    Unknown names fail with the closest match and the full list."""
+    bps = cfg.get("blueprints", {})
+    if name in bps:
+        return name
+    for b in bps:
+        if b.lower() == str(name or "").lower():
+            return b
+    known = ", ".join(sorted(bps)) or "(none yet — create one: cell add NAME)"
+    raise CellError(f"unknown blueprint '{name}'.{suggest(name, bps)} Known: {known}")
+
+
 def get_blueprint(cfg: dict, name: str) -> dict:
-    bp = cfg["blueprints"].get(name)
-    if not bp:
-        known = ", ".join(sorted(cfg["blueprints"])) or "(none yet — see 'cell add')"
-        raise CellError(f"unknown blueprint '{name}'. Known: {known}")
-    return bp
+    return cfg["blueprints"][resolve_blueprint(cfg, name)]
 
 
 # --------------------------------------------------------------------------
@@ -420,10 +436,11 @@ def tty() -> bool:
 
 
 def confirm(prompt: str, assume_yes: bool = False) -> bool:
+    sys.stdout.flush()
     if assume_yes:
         return True
     if not tty():
-        warn("not a terminal; refusing without --yes")
+        warn("not a terminal: add --yes to confirm")
         return False
     try:
         return input(f"{prompt} [y/N] ").strip().lower() in ("y", "yes")
@@ -440,6 +457,16 @@ def ask(prompt: str, default: str = "") -> str:
         print()
         return default
     return v or default
+
+
+def ask_choice(prompt: str, options, default: str = "") -> str:
+    """ask() until the answer is one of options; blank/EOF -> default."""
+    options = sorted(options)
+    while True:
+        v = ask(prompt, default)
+        if not v or v in options:
+            return v
+        print(f"  '{v}' is not one of: {', '.join(options)}.{suggest(v, options)}")
 
 
 def ask_secret(prompt: str) -> str:
@@ -459,6 +486,26 @@ def camel(event: str) -> str:
     if "_" not in event and event[:1].isupper():
         return event
     return "".join(w.capitalize() for w in event.split("_"))
+
+
+# Claude Code hook events (others still work; cell only notes them)
+CLAUDE_HOOK_EVENTS = ("PreToolUse", "PostToolUse", "PostToolUseFailure", "Notification", "UserPromptSubmit",
+                      "Stop", "SubagentStart", "SubagentStop", "PreCompact", "PostCompact",
+                      "SessionStart", "SessionEnd", "PermissionRequest")
+
+
+def hook_key(event: str) -> str:
+    """Config key for a hook event: Stop / UserPromptSubmit / user-prompt-submit
+    -> stop / user_prompt_submit, so one event never ends up under two keys."""
+    e = str(event or "").strip().replace("-", "_")
+    if "_" not in e:
+        e = re.sub(r"(?<!^)(?=[A-Z])", "_", e)
+    return e.lower()
+
+
+def run_hint(name: str) -> str:
+    """The shortest command that launches a blueprint."""
+    return f"cell {name}" if name not in COMMANDS and name not in ALIASES else f"cell run {name}"
 
 
 def valid_name(name: str) -> bool:
@@ -566,7 +613,8 @@ def tier_models(prov: dict, model: str) -> dict:
 
 
 def build_plan(cfg, name, cwd, api_key_flag=None):
-    bp = get_blueprint(cfg, name)
+    name = resolve_blueprint(cfg, name)
+    bp = cfg["blueprints"][name]
     runtimes, providers = get_runtimes(cfg), get_providers(cfg)
     rt_name = bp.get("runtime", "")
     rt = runtimes.get(rt_name)
@@ -599,6 +647,7 @@ def build_plan(cfg, name, cwd, api_key_flag=None):
         "process_env": {},      # env exported only at launch (secrets live here)
         "drop_env": [],         # ambient vars removed from the child env
         "warnings": [],
+        "fatal": "",            # set when this blueprint cannot work at all
     }
     third_party = bool(prov.get("base_url"))
     if rt.get("config") == "claude":
@@ -628,10 +677,11 @@ def build_plan(cfg, name, cwd, api_key_flag=None):
             else:
                 plan["drop_env"].append("ANTHROPIC_API_KEY")
         else:
-            plan["warnings"].append(
+            plan["fatal"] = (
                 f"provider '{provider}' has no Anthropic-compatible endpoint, so the claude "
                 f"runtime cannot use it. Give it a proxy URL: cell provider add {provider} "
-                f"--base-url http://… --force   (or use it with the kimi runtime)")
+                f"--base-url http://… --force   (or: cell edit {name} --runtime kimi)")
+            plan["warnings"].append(plan["fatal"])
     if key and plan["key_env"]:
         plan["process_env"].setdefault(plan["key_env"], key)
     return plan
@@ -706,16 +756,33 @@ def load_settings(env_dir: Path):
         return {}
 
 
+def git_repo(cwd: Path):
+    """(top-level dir, info/exclude path) when cwd is anywhere inside a git
+    work tree, else None. Asks git itself, so subfolders and worktrees work."""
+    if not which("git"):
+        return None
+    try:
+        r = subprocess.run(["git", "-C", str(cwd), "rev-parse", "--show-toplevel", "--git-path", "info/exclude"],
+                           capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    lines = r.stdout.splitlines()
+    if r.returncode != 0 or len(lines) < 2:
+        return None
+    exc = Path(lines[1])
+    return Path(lines[0]), (exc if exc.is_absolute() else (cwd / exc).resolve())
+
+
 def git_exclude(cwd: Path, env_dir: Path):
     """Keep env dirs out of git: they hold credentials and session logs.
-    Uses .git/info/exclude so nothing in the repo itself changes."""
-    git = cwd / ".git"
-    if not git.is_dir():
+    Uses the repo's info/exclude so nothing in the repo itself changes. The
+    pattern has no leading slash, so it covers env dirs in every subfolder."""
+    repo = git_repo(cwd)
+    if not repo:
         return
-    info = git / "info"
+    exc = repo[1]
     try:
-        info.mkdir(exist_ok=True)
-        exc = info / "exclude"
+        exc.parent.mkdir(parents=True, exist_ok=True)
         text = exc.read_text(encoding="utf-8") if exc.exists() else ""
         if GIT_EXCLUDE_LINE not in text.splitlines():
             with open(exc, "a", encoding="utf-8") as f:
@@ -843,6 +910,149 @@ def write_instance(plan, cfg, cwd: Path):
     return fresh, copied
 
 
+# --------------------------------------------------------------------------
+# Sessions: what each runtime keeps in its env dir
+#   claude: projects/<cwd slug>/<uuid>.jsonl (titles: custom-title, ai-title)
+#   kimi:   sessions/<wd_…>/session_<uuid>/state.json (title, lastPrompt, cwd)
+# --------------------------------------------------------------------------
+
+def _session_layout(inst, runtimes):
+    rt = runtimes.get(inst["runtime"]) or {}
+    if rt.get("config") == "claude":
+        return "claude"
+    if inst["runtime"] == "kimi" or rt.get("binary") == "kimi" or (inst["path"] / "sessions").is_dir():
+        return "kimi"
+    return None
+
+
+def _claude_slug(cwd: Path) -> str:
+    """Claude Code files a session under its launch dir, every
+    non-alphanumeric character turned into '-'."""
+    return re.sub(r"[^A-Za-z0-9]", "-", str(cwd))
+
+
+def _same_dir(a, b) -> bool:
+    try:
+        return os.path.realpath(str(a)) == os.path.realpath(str(b))
+    except (OSError, ValueError):
+        return False
+
+
+def short_id(sid: str) -> str:
+    return sid.removeprefix("session_")[:8]
+
+
+def list_sessions(inst, runtimes, cwd: Path):
+    """Sessions in one env dir, newest first: {id, mtime, here, ...}. 'here'
+    = started in cwd (a runtime resumes those). None = layout unknown (custom
+    runtime). Cheap: titles are read later, only for what gets shown."""
+    p, layout = inst["path"], _session_layout(inst, runtimes)
+    out = []
+    if layout == "claude":
+        slug = _claude_slug(cwd)
+        for f in p.glob("projects/*/*.jsonl"):
+            if f.name.startswith("agent-"):          # subagent side chains, not sessions
+                continue
+            d = f.parent.name
+            here = d == slug or (len(slug) > 200 and d.startswith(slug[:200]))
+            out.append({"id": f.stem, "path": f, "mtime": f.stat().st_mtime, "here": here, "layout": layout})
+    elif layout == "kimi":
+        for st in p.glob("sessions/*/session_*/state.json"):
+            try:
+                data = json.loads(st.read_text(encoding="utf-8"))
+            except (ValueError, OSError):
+                continue
+            if data.get("archived") is True:
+                continue
+            upd = data.get("updatedAt")
+            mtime = int(upd) / 1000 if str(upd or "").isdigit() else st.stat().st_mtime
+            out.append({"id": data.get("id") or st.parent.name, "path": st, "mtime": mtime,
+                        "here": _same_dir(data.get("cwd") or "", cwd), "layout": layout,
+                        "title": data.get("title") or "", "last": data.get("lastPrompt") or "",
+                        "cwd": data.get("cwd") or ""})
+    else:
+        return None
+    out.sort(key=lambda s: s["mtime"], reverse=True)
+    return out
+
+
+_CLAUDE_TITLES = ((b'"type":"custom-title"', "customTitle", 3),
+                  (b'"type":"ai-title"', "aiTitle", 2),
+                  (b'"type":"summary"', "summary", 1))
+
+
+def session_title(s) -> str:
+    """Best one-line description: the user's own title, else the runtime's
+    generated one, else the last / first prompt."""
+    if s["layout"] == "kimi":
+        title, last = s.get("title", ""), s.get("last", "")
+    else:
+        title, last, first, rank = "", "", "", 0
+        try:
+            with open(s["path"], "rb") as f:
+                for line in f:
+                    if b'"type":"last-prompt"' in line:
+                        try:
+                            last = json.loads(line).get("lastPrompt") or last
+                        except ValueError:
+                            pass
+                        continue
+                    for marker, key, r in _CLAUDE_TITLES:
+                        if marker in line and r >= rank:
+                            try:
+                                v = json.loads(line).get(key)
+                            except ValueError:
+                                v = None
+                            if v:
+                                title, rank = v, r
+                            break
+                    if not first and b'"type":"user"' in line and b'"isMeta":true' not in line:
+                        try:
+                            c = json.loads(line).get("message", {}).get("content")
+                        except ValueError:
+                            c = None
+                        if isinstance(c, list):
+                            c = " ".join(x.get("text", "") for x in c if isinstance(x, dict))
+                        if isinstance(c, str) and c.strip() and not c.lstrip().startswith("<"):
+                            first = c
+        except OSError:
+            pass
+        last = last or first
+    title = " ".join(str(title).split())
+    last = " ".join(str(last).split())
+    if title and last and len(title) <= 12 and last != title:
+        return f"{title} · {last}"             # "hi" says nothing; the last prompt does
+    return title or last or "(empty)"
+
+
+def find_session_ids(inst, runtimes, prefix: str) -> list:
+    """Full session ids in this env dir that start with prefix (>= 4 chars)."""
+    prefix = (prefix or "").removeprefix("session_")
+    if len(prefix) < 4:
+        return []
+    p, layout, pat = inst["path"], _session_layout(inst, runtimes), glob.escape(prefix)
+    if layout == "claude":
+        return sorted({f.stem for f in p.glob(f"projects/*/{pat}*.jsonl")})
+    if layout == "kimi":
+        return sorted({d.name for d in p.glob(f"sessions/*/session_{pat}*") if d.is_dir()})
+    return []
+
+
+def resolve_session(plan, cfg, resume):
+    """-r 3f2a9c1e -> the full session id. Anything unknown passes through
+    (a full id, a session name, or a search term for the runtime's picker)."""
+    if not isinstance(resume, str) or not plan["env_dir"].is_dir():
+        return resume
+    inst = {"runtime": plan["runtime"], "name": plan["name"], "path": plan["env_dir"]}
+    ids = find_session_ids(inst, get_runtimes(cfg), resume)
+    if resume in ids or len(ids) == 0:
+        return resume
+    if len(ids) == 1:
+        return ids[0]
+    raise CellError(f"session '{resume}' matches {len(ids)} sessions ({', '.join(short_id(i) for i in ids[:4])}…); "
+                    f"type more of the id")
+
+
 def launch_command(plan, prompt=None, resume=None, cont=False, model=None, extra=None):
     rt = plan["rt"]
     cmd = [rt["binary"]]
@@ -893,20 +1103,25 @@ def cmd_add(args, cfg):
     if not rt_name and guided:
         opts = ", ".join(f"{r}{'' if which(rt.get('binary', '')) else ' (not installed)'}"
                          for r, rt in sorted(runtimes.items()))
-        rt_name = ask(f"Runtime ({opts})", "claude")
+        rt_name = ask_choice(f"Runtime ({opts})", runtimes, "claude")
     if not rt_name:
-        raise CellError("--runtime is required")
+        # claude, unless the provider can only work in kimi (kimi, openai)
+        p0 = args.provider or "anthropic"
+        rt_name = "claude" if (p0 == "anthropic" or providers.get(p0, {}).get("base_url")
+                               or "kimi" not in runtimes) else "kimi"
+        note(f"runtime: {rt_name} (default; --runtime to choose)")
     if rt_name not in runtimes:
-        raise CellError(f"unknown runtime '{rt_name}'. Known: {', '.join(sorted(runtimes))}. "
+        raise CellError(f"unknown runtime '{rt_name}'.{suggest(rt_name, runtimes)} Known: {', '.join(sorted(runtimes))}. "
                         f"Add your own with 'cell runtime add'.")
     rt = runtimes[rt_name]
 
     provider = args.provider
     if not provider and guided:
-        provider = ask(f"Provider ({', '.join(sorted(providers))})", "anthropic")
+        provider = ask_choice(f"Provider ({', '.join(sorted(providers))})", providers,
+                              "kimi" if rt_name == "kimi" and "kimi" in providers else "anthropic")
     provider = provider or "anthropic"
     if provider not in providers:
-        raise CellError(f"unknown provider '{provider}'. Known: {', '.join(sorted(providers))}. "
+        raise CellError(f"unknown provider '{provider}'.{suggest(provider, providers)} Known: {', '.join(sorted(providers))}. "
                         f"Add your own with: cell provider add {provider} --base-url URL --key-env VAR")
     prov = providers[provider]
     if rt.get("config") == "claude" and provider != "anthropic" and not prov.get("base_url"):
@@ -917,6 +1132,9 @@ def cmd_add(args, cfg):
     model = args.model
     if not model and guided:
         model = ask("Model", prov.get("default_model", ""))
+    if not model and prov.get("default_model"):
+        model = prov["default_model"]
+        note(f"model: {model} (provider default; --model to choose)")
     if not model:
         raise CellError("--model is required")
 
@@ -937,15 +1155,23 @@ def cmd_add(args, cfg):
     if auth != "login" and api_key and key_env:
         raise CellError("use either --api-key or --api-key-env, not both")
 
+    def persona_ok(p):
+        return not p or Path(p).expanduser().is_file() or resolve_template(p)[0] is not None
+
     persona = args.persona or ""
-    if not persona and guided:
+    while not persona and guided:
         persona = ask(f"Persona: template ({', '.join(template_names())}) or file path, blank = none")
-    if persona and not Path(persona).expanduser().is_file() and resolve_template(persona)[0] is None:
-        raise CellError(f"persona '{persona}' is not a template or a file")
+        if persona_ok(persona):
+            break
+        print(f"  '{persona}' is not a template or an existing file")
+        persona = ""
+    if not persona_ok(persona):
+        raise CellError(f"persona '{persona}' is not a template ({', '.join(template_names())}) or an existing file")
 
     permissions = args.permissions or ""
     if not permissions and guided:
-        permissions = ask(f"Permissions ({'/'.join(PERMISSION_NAMES)}), blank = runtime default")
+        permissions = ask_choice(f"Permissions ({'/'.join(PERMISSION_NAMES)}), blank = runtime default",
+                                 PERMISSION_NAMES)
     if permissions and permissions not in PERMISSION_NAMES:
         raise CellError(f"permissions must be one of: {', '.join(PERMISSION_NAMES)}")
 
@@ -963,23 +1189,52 @@ def cmd_add(args, cfg):
     cfg["blueprints"][name] = bp
     save_config(cfg)
     key, src = resolve_key(cfg, bp, providers)
-    state = src if (key or auth == "login") else "no key yet"
+    state = "login" if auth == "login" else (f"key from {src}" if key else "no key yet")
     print(f"added blueprint '{name}': {rt_name} / {provider} / {model}  [{state}]")
-    print(f"next: cd <project> && cell run {name}      (preview first: cell show {name})")
+    if not key and auth != "login" and not prov.get("login"):
+        print(f"next: cell keys set {provider}   then, in a project folder:  {run_hint(name)}")
+    else:
+        print(f"next: in a project folder run  {run_hint(name)}      (preview first: cell show {name})")
+
+
+def describe_blueprint(name, bp, cfg):
+    providers = get_providers(cfg)
+    key, src = resolve_key(cfg, bp, providers)
+    if bp.get("auth") == "login":
+        auth = "login (subscription)"
+    elif key:
+        auth = f"key from {src}"
+    elif providers.get(bp.get("provider"), {}).get("login"):
+        auth = "none set: the runtime will ask you to log in"
+    else:
+        auth = f"NO KEY (cell keys set {bp.get('provider')})"
+    hooks = bp.get("hooks") or {}
+    hk = ", ".join(f"{h} {'on' if hooks.get(h, True) else 'off'}" for h in (cfg.get("hooks") or {}))
+    print(f"{name}")
+    print(f"  runtime      {bp.get('runtime', '')}")
+    print(f"  provider     {bp.get('provider', '')}")
+    print(f"  model        {bp.get('model', '')}")
+    print(f"  auth         {auth}")
+    print(f"  persona      {bp.get('persona') or '-'}")
+    print(f"  permissions  {bp.get('permissions') or '(runtime default)'}")
+    print(f"  hooks        {hk or '(none configured: cell hooks set …)'}")
 
 
 def cmd_edit(args, cfg):
-    bp = get_blueprint(cfg, args.name)
+    args.name = resolve_blueprint(cfg, args.name)
+    bp = cfg["blueprints"][args.name]
     runtimes, providers = get_runtimes(cfg), get_providers(cfg)
     changed = []
     if args.runtime is not None:
         if args.runtime not in runtimes:
-            raise CellError(f"unknown runtime '{args.runtime}'. Known: {', '.join(sorted(runtimes))}")
+            raise CellError(f"unknown runtime '{args.runtime}'.{suggest(args.runtime, runtimes)} "
+                            f"Known: {', '.join(sorted(runtimes))}")
         bp["runtime"] = args.runtime
         changed.append("runtime")
     if args.provider is not None:
         if args.provider not in providers:
-            raise CellError(f"unknown provider '{args.provider}'. Known: {', '.join(sorted(providers))}")
+            raise CellError(f"unknown provider '{args.provider}'.{suggest(args.provider, providers)} "
+                            f"Known: {', '.join(sorted(providers))}")
         bp["provider"] = args.provider
         changed.append("provider")
         if bp.get("auth") == "login" and not providers[args.provider].get("login"):
@@ -1017,20 +1272,33 @@ def cmd_edit(args, cfg):
             raise CellError(f"permissions must be one of: {', '.join(PERMISSION_NAMES)} (or '' to clear)")
         bp["permissions"] = args.permissions
         changed.append("permissions")
-    hooks = dict(bp.get("hooks") or {})
-    for h in (cfg.get("hooks") or {}):
+    configured = list(cfg.get("hooks") or {})
+    hooks = {h: v for h, v in (bp.get("hooks") or {}).items() if h in configured}
+    for h in configured:
         hooks.setdefault(h, True)
-    if args.no_hooks is not None:
-        for h in (args.no_hooks or list(hooks)):
-            hooks[h] = False
-        changed.append("hooks")
-    if args.hooks is not None:
-        for h in (args.hooks or list(hooks)):
-            hooks[h] = True
-        changed.append("hooks")
+    for flag, value in ((args.no_hooks, False), (args.hooks, True)):
+        if flag is None:
+            continue
+        names = [hook_key(h) for h in flag] or configured
+        bad = [h for h in names if h not in configured]
+        if bad:
+            raise CellError(f"no hook '{bad[0]}'.{suggest(bad[0], configured)} "
+                            f"Configured: {', '.join(configured) or 'none (cell hooks set …)'}")
+        for h in names:
+            hooks[h] = value
+        changed.append(f"hooks ({', '.join(h + (' on' if value else ' off') for h in names)})")
     bp["hooks"] = hooks
     if not changed:
-        raise CellError("nothing to change — see 'cell edit --help'")
+        describe_blueprint(args.name, bp, cfg)
+        print(f"\nchange with: cell edit {args.name} --model M | --provider P | --runtime R | --persona T|FILE\n"
+              f"             --permissions {'|'.join(PERMISSION_NAMES)} ('' clears) | --login | --api-key-env VAR\n"
+              f"             --no-hooks [EVENT…] | --hooks [EVENT…]")
+        return
+    rt, prov = runtimes.get(bp.get("runtime")) or {}, providers.get(bp.get("provider")) or {}
+    if rt.get("config") == "claude" and bp.get("provider") != "anthropic" and not prov.get("base_url"):
+        raise CellError(f"the claude runtime cannot use provider '{bp.get('provider')}' (no Anthropic-compatible "
+                        f"endpoint). Use --runtime kimi, or give it a proxy: "
+                        f"cell provider add {bp.get('provider')} --base-url http://… --force")
     save_config(cfg)
     print(f"updated '{args.name}': {', '.join(changed)}  (applies on next 'cell run')")
 
@@ -1056,34 +1324,54 @@ def cmd_list(args, cfg):
 
 
 def cmd_remove(args, cfg):
-    get_blueprint(cfg, args.name)
+    args.name = resolve_blueprint(cfg, args.name)
     del cfg["blueprints"][args.name]
     save_config(cfg)
     print(f"removed blueprint '{args.name}' (instance dirs stay; 'cell clean {args.name}' deletes them)")
 
 
 def _pick_blueprint(args, cfg) -> str:
+    """Which blueprint 'run'/'show' means: the one named, else the only one
+    with an env dir here (or that owns the -r session id), else the only
+    blueprint at all, else ask (in a terminal) or explain how to name it."""
     bps = sorted(cfg.get("blueprints", {}))
     if not bps:
-        raise CellError("no blueprints defined. Use 'cell add' first.")
+        raise CellError("no blueprints yet. Create one: cell add NAME   (or type 'cell' for the menu)")
     resume = getattr(args, "resume", None)
-    if not args.name and isinstance(resume, str) and resume in bps:
-        # `cell run -r max`: -r takes an optional session ID and swallowed the name
-        args.name, args.resume = resume, True
+    if not args.name and isinstance(resume, str):
+        try:    # `cell run -r max`: -r takes an optional session ID and swallowed the name
+            args.name, args.resume = resolve_blueprint(cfg, resume), True
+        except CellError:
+            pass
     if args.name:
-        if args.name not in bps:
-            raise CellError(f"no blueprint '{args.name}'. Known: {', '.join(bps)}")
+        args.name = resolve_blueprint(cfg, args.name)
         return args.name
-    here = sorted({i["name"] for i in find_instances(Path.cwd(), get_runtimes(cfg))} & set(bps))
+    runtimes = get_runtimes(cfg)
+    insts = [i for i in find_instances(Path.cwd(), runtimes) if i["name"] in bps]
+    here = sorted({i["name"] for i in insts})
+    if isinstance(args.resume, str):
+        owners = sorted({i["name"] for i in insts if find_session_ids(i, runtimes, args.resume)})
+        if len(owners) == 1:
+            return owners[0]
     if len(here) == 1:
         return here[0]
     if len(bps) == 1:
         return bps[0]
     verb = getattr(args, "cmd", None) or "run"
-    pool = here or bps
-    hint = "each has an env dir here" if here else "no env dir here yet"
-    raise CellError(f"which blueprint? {', '.join(pool)} ({hint}). "
-                    f"Put the name first: cell {verb} {pool[0]} [-r|-c|-p ...]")
+    if tty():
+        print("which blueprint?   (• = has an env dir in this folder)")
+        for n, b in enumerate(bps, 1):
+            bp = cfg["blueprints"][b]
+            print(f"  {n} {'•' if b in here else ' '} {b:<14} {bp.get('runtime', '')}/{bp.get('provider', '')}/{bp.get('model', '')}")
+        pick = ask("number (Enter = cancel)")
+        if pick.isdigit() and 1 <= int(pick) <= len(bps):
+            return bps[int(pick) - 1]
+        raise CellError(f"cancelled. Next time name it: {run_hint(bps[0]) if verb == 'run' else f'cell {verb} {bps[0]}'}")
+    where = f" (env dirs here: {', '.join(here)})" if here else ""
+    first = (here or bps)[0]
+    example = run_hint(first) if verb == "run" else f"cell {verb} {first}"
+    raise CellError(f"which blueprint? {', '.join(bps)}{where}. "
+                    f"Name it first: {example} [-r|-c|-p ...]")
 
 
 def _print_plan(plan, cmd, env, fresh_note=True):
@@ -1109,7 +1397,7 @@ def _print_plan(plan, cmd, env, fresh_note=True):
     for k in plan["drop_env"]:
         if k in os.environ:
             print(f"    unset {k}  (was set in your shell)")
-    print(f"command      {' '.join(cmd)}")
+    print(f"command      {shlex.join(cmd)}")
     for w in plan["warnings"]:
         warn(w)
 
@@ -1118,7 +1406,8 @@ def cmd_show(args, cfg):
     """Dry-run: print exactly what would happen, secrets masked."""
     name = _pick_blueprint(args, cfg)
     plan = build_plan(cfg, name, Path.cwd(), api_key_flag=args.api_key)
-    cmd, env = launch_command(plan, args.prompt, args.resume, args.cont, args.model, args.extra)
+    resume = resolve_session(plan, cfg, args.resume)
+    cmd, env = launch_command(plan, args.prompt, resume, args.cont, args.model, args.extra)
     _print_plan(plan, cmd, env)
     if plan["rt"].get("config") == "claude":
         existing = load_settings(plan["env_dir"]) if plan["env_dir"].exists() else {}
@@ -1134,6 +1423,8 @@ def cmd_run(args, cfg):
     name = _pick_blueprint(args, cfg)
     cwd = Path.cwd()
     plan = build_plan(cfg, name, cwd, api_key_flag=args.api_key)
+    if plan["fatal"]:
+        raise CellError(plan["fatal"])
     binary = plan["rt"]["binary"]
     if not which(binary):
         raise CellError(f"'{binary}' is not installed or not in PATH. "
@@ -1154,8 +1445,9 @@ def cmd_run(args, cfg):
         note(f"runtime '{plan['runtime']}' has no resume flag configured; ignoring --resume")
     if args.cont and not plan["rt"].get("continue_flag"):
         note(f"runtime '{plan['runtime']}' has no continue flag configured; ignoring --continue")
+    resume = resolve_session(plan, cfg, args.resume)
     fresh, copied = write_instance(plan, cfg, cwd)
-    cmd, env = launch_command(plan, prompt, args.resume, args.cont, args.model, extra)
+    cmd, env = launch_command(plan, prompt, resume, args.cont, args.model, extra)
     for w in plan["warnings"]:
         warn(w)
     if fresh:
@@ -1213,12 +1505,15 @@ def cmd_keys(args, cfg):
     if args.action == "set":
         if not args.provider:
             raise CellError("provider name required: cell keys set <provider> [key]")
-        if args.provider not in providers:
-            warn(f"'{args.provider}' is not a known provider ({', '.join(sorted(providers))}); storing anyway")
+        if args.provider not in providers and args.provider != "voice":    # 'voice' = speech API key
+            warn(f"'{args.provider}' is not a known provider.{suggest(args.provider, providers)} "
+                 f"Known: {', '.join(sorted(providers))}. Storing anyway")
         key = _get_key_arg(args, f"API key for {args.provider}")
         cfg["keys"][args.provider] = key
         save_config(cfg)
-        print(f"stored key for '{args.provider}' ({mask(key)}) — used by every blueprint on that provider")
+        print(f"stored key for '{args.provider}' ({mask(key)}) — "
+              + ("used by 'cell voice' (api engine)" if args.provider == "voice" else
+                 "used by every blueprint on that provider"))
     elif args.action == "list":
         if not cfg["keys"]:
             print("no global keys stored (cell keys set <provider>)")
@@ -1226,15 +1521,16 @@ def cmd_keys(args, cfg):
             print(f"  {prov:<14} {mask(key)}")
     elif args.action == "remove":
         if not args.provider:
-            raise CellError("provider name required")
+            raise CellError(f"which key? stored: {', '.join(sorted(cfg['keys'])) or 'none'}")
         if cfg["keys"].pop(args.provider, None) is None:
-            raise CellError(f"no global key stored for '{args.provider}'")
+            raise CellError(f"no global key stored for '{args.provider}'. Stored: {', '.join(sorted(cfg['keys'])) or 'none'}")
         save_config(cfg)
         print(f"removed key for '{args.provider}'")
 
 
 def cmd_key(args, cfg):
-    bp = get_blueprint(cfg, args.name)
+    args.name = resolve_blueprint(cfg, args.name)
+    bp = cfg["blueprints"][args.name]
     key = _get_key_arg(args, f"API key for blueprint {args.name}")
     bp["api_key"], bp["auth"], bp["key_env"] = key, "", ""
     save_config(cfg)
@@ -1257,17 +1553,33 @@ def cmd_provider(args, cfg):
         used = {}
         for bn, bp in cfg["blueprints"].items():
             used.setdefault(bp.get("provider"), []).append(bn)
+        rows = []
         for name, p in sorted(providers.items()):
-            custom = "custom " if name in cfg["providers"] and name not in DEFAULT_PROVIDERS else ""
-            key = "key ✓" if cfg["keys"].get(name) else ("$" + p.get("key_env", "") if os.environ.get(p.get("key_env", "")) else "no key")
-            ep = p.get("base_url") or ("login/first-party" if name == "anthropic" else "(no claude endpoint)")
-            print(f"  {name:<12} {custom}{ep:<58} {key:<22} {p.get('note','')}")
-            if used.get(name):
-                print(f"  {'':<12} used by: {', '.join(used[name])}")
-        print("\nadd your own: cell provider add NAME --base-url URL --key-env VAR   (cell provider add --help)")
+            if cfg["keys"].get(name):
+                key = "key stored"
+            elif os.environ.get(p.get("key_env", "")):
+                key = "$" + p["key_env"]
+            elif p.get("token"):
+                key = "not needed"
+            elif p.get("login"):
+                key = "login"
+            else:
+                key = "no key"
+            ep = re.sub(r"^https?://", "", p.get("base_url") or "") or \
+                ("first-party" if name == "anthropic" else "- (kimi runtime / proxy)")
+            custom = " *" if name in cfg["providers"] else ""
+            rows.append((name + custom, key, ep, ", ".join(sorted(used.get(name, [])))))
+        w = [max(len(r[i]) for r in rows + [("provider", "key", "claude endpoint", "")]) for i in range(3)]
+        print(f"  {'provider':<{w[0]}}  {'key':<{w[1]}}  {'claude endpoint':<{w[2]}}  used by")
+        for r in rows:
+            print(f"  {r[0]:<{w[0]}}  {r[1]:<{w[1]}}  {r[2]:<{w[2]}}  {r[3]}".rstrip())
+        if cfg["providers"]:
+            print("  * = custom or overridden in your config")
+        print("\ndetails: cell provider show NAME      add your own: cell provider add NAME --base-url URL --key-env VAR")
     elif args.action == "show":
         if not args.name or args.name not in providers:
-            raise CellError(f"provider name required, one of: {', '.join(sorted(providers))}")
+            raise CellError(f"{'which provider?' if not args.name else 'unknown provider ' + repr(args.name) + '.'}"
+                            f"{suggest(args.name, providers) if args.name else ''} One of: {', '.join(sorted(providers))}")
         print(dumps_toml({"providers": {args.name: providers[args.name]}}), end="")
     elif args.action == "add":
         name = args.name
@@ -1318,6 +1630,8 @@ def cmd_provider(args, cfg):
         print(f"{'updated' if name in providers else 'added'} provider '{name}'")
         print(f"next: cell keys set {name}   then   cell add <blueprint> --provider {name} --model <model>")
     elif args.action == "remove":
+        if not args.name:
+            raise CellError(f"which provider? custom ones: {', '.join(sorted(cfg['providers'])) or 'none'}")
         if args.name not in cfg["providers"]:
             if args.name in DEFAULT_PROVIDERS:
                 raise CellError(f"'{args.name}' is built-in; override fields with 'cell provider add {args.name} --force …'")
@@ -1367,17 +1681,20 @@ def cmd_runtime(args, cfg):
     elif args.action == "install":
         rt = runtimes.get(args.name or "")
         if not rt:
-            raise CellError(f"unknown runtime '{args.name}'. Known: {', '.join(sorted(runtimes))}")
+            raise CellError(f"{'which runtime?' if not args.name else 'unknown runtime ' + repr(args.name) + '.'} "
+                            f"Known: {', '.join(sorted(runtimes))}")
         cmd_str = rt.get("install_windows" if os.name == "nt" else "install_unix")
         if not cmd_str:
             raise CellError(f"no installer known for '{args.name}' — install it manually")
         print(f"this will run:\n  {cmd_str}")
         if not confirm("Proceed?", args.yes):
-            return
+            return 1
         code = subprocess.call(cmd_str, shell=True)
         if code != 0:
             raise CellError(f"installer exited with {code}")
     elif args.action == "remove":
+        if not args.name:
+            raise CellError(f"which runtime? custom ones: {', '.join(sorted(cfg['runtimes'])) or 'none'}")
         if args.name not in cfg.get("runtimes", {}):
             if args.name in DEFAULT_RUNTIMES:
                 raise CellError(f"'{args.name}' is built-in and has no overrides to remove")
@@ -1400,24 +1717,40 @@ def cmd_hooks(args, cfg):
     elif args.action == "set":
         if not args.event or not args.command:
             raise CellError("usage: cell hooks set <event> '<shell command>'   (event: stop, user_prompt_submit, post_compact, …)")
-        hooks[args.event] = args.command
+        key = hook_key(args.event)
+        if camel(key) not in CLAUDE_HOOK_EVENTS:
+            note(f"'{camel(key)}' is not a Claude Code hook event cell knows "
+                 f"({', '.join(CLAUDE_HOOK_EVENTS)}); setting it anyway")
+        existed = key in hooks
+        hooks[key] = args.command
         save_config(cfg)
-        print(f"hook '{args.event}' ({camel(args.event)}) set — applied to every claude blueprint on next run")
+        print(f"hook '{key}' ({camel(key)}) {'replaced' if existed else 'set'} — applied to every claude blueprint on next run")
     elif args.action == "remove":
-        if args.event not in hooks:
-            raise CellError(f"no hook '{args.event}'")
-        del hooks[args.event]
+        if not args.event:
+            raise CellError(f"which hook? configured: {', '.join(hooks) or 'none'}")
+        key = hook_key(args.event)
+        if key not in hooks:
+            raise CellError(f"no hook '{args.event}'.{suggest(key, hooks)} Configured: {', '.join(hooks) or 'none'}")
+        del hooks[key]
+        for bp in cfg["blueprints"].values():           # drop per-blueprint on/off switches for it
+            if isinstance(bp.get("hooks"), dict):
+                bp["hooks"].pop(key, None)
         save_config(cfg)
-        print(f"removed hook '{args.event}'")
+        print(f"removed hook '{key}' (claude envs drop it on their next 'cell run')")
     elif args.action == "import":
-        src = Path(args.event or ".").expanduser()
-        if src.is_dir() and (src / SETTINGS_FILE).exists():
-            src_dir = src
+        if args.event:                    # a path, or a blueprint whose env dir is in this folder
+            src_dir = Path(args.event).expanduser()
+            if not src_dir.exists():
+                own = [i["path"] for i in find_instances(Path.cwd(), get_runtimes(cfg))
+                       if i["name"] == args.event.lower()]
+                src_dir = own[0] if own else src_dir
+            if not (src_dir / SETTINGS_FILE).is_file():
+                raise CellError(f"{src_dir} has no {SETTINGS_FILE} to import hooks from")
         else:
             cands = [i for i in find_instances(Path.cwd(), get_runtimes(cfg))
                      if (i["path"] / SETTINGS_FILE).exists()]
             if len(cands) != 1:
-                raise CellError("give the env dir to import from: cell hooks import .claude-env-max")
+                raise CellError("which env dir? cell hooks import .claude-env-max   (or a path to one)")
             src_dir = cands[0]["path"]
         try:
             data = json.loads((src_dir / SETTINGS_FILE).read_text(encoding="utf-8"))
@@ -1425,16 +1758,16 @@ def cmd_hooks(args, cfg):
             raise CellError(f"cannot read {src_dir / SETTINGS_FILE}: {e}")
         n = 0
         for ev, groups in (data.get("hooks") or {}).items():
-            for g in groups:
-                for h in g.get("hooks", []):
-                    if h.get("type") == "command" and h.get("command"):
-                        key = re.sub(r"(?<!^)(?=[A-Z])", "_", ev).lower()
-                        hooks[key] = h["command"]
-                        n += 1
-                        break
-                else:
-                    continue
-                break
+            cmds = [(g.get("matcher") or "", h["command"]) for g in (groups or []) if isinstance(g, dict)
+                    for h in g.get("hooks", []) if h.get("type") == "command" and h.get("command")]
+            if not cmds:
+                continue
+            hooks[hook_key(ev)] = cmds[0][1]
+            n += 1
+            if cmds[0][0] not in ("", "*"):
+                note(f"{ev}: matcher '{cmds[0][0]}' dropped — cell hooks run for every tool")
+            if len(cmds) > 1:
+                note(f"{ev}: {len(cmds)} commands found, imported only the first")
         copied = 0
         if (src_dir / "hooks").is_dir():
             dst = seed_dir("claude") / "hooks"
@@ -1453,23 +1786,67 @@ def cmd_hooks(args, cfg):
 # --------------------------------------------------------------------------
 
 def cmd_sessions(args, cfg):
+    """Sessions started in this folder, newest first, with a short id and a
+    title. In a terminal, type a number to open that session."""
     cwd = Path.cwd()
-    instances = find_instances(cwd, get_runtimes(cfg))
+    runtimes = get_runtimes(cfg)
+    instances = find_instances(cwd, runtimes)
     if args.name:
-        instances = [i for i in instances if i["name"] == args.name]
-    any_found = False
+        want = args.name.lower()
+        names = sorted({i["name"] for i in instances})
+        instances = [i for i in instances if i["name"].lower() == want]
+        if not instances:
+            raise CellError(f"no env dir for '{args.name}' in this folder.{suggest(args.name, names)} "
+                            f"Here: {', '.join(names) or 'none'}")
+    width = shutil.get_terminal_size((100, 24)).columns
+    rows, here_rows, hidden = [], [], 0
     for inst in instances:
-        files = [f for f in inst["path"].rglob("*.jsonl")
-                 if not ({"telemetry", "cache", "file-history", "plugins", "shell-snapshots"} & set(f.parts))]
-        files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-        if files:
-            any_found = True
-            print(f"{inst['name']} ({inst['runtime']}):")
-            for f in files[:args.limit]:
-                ts = datetime.datetime.fromtimestamp(f.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
-                print(f"  {ts}  {f.relative_to(inst['path'])}")
-    if not any_found:
-        print("no sessions found in this project")
+        sessions = list_sessions(inst, runtimes, cwd)
+        if sessions is None:                     # custom runtime: show its newest log files
+            files = sorted(inst["path"].rglob("*.jsonl"), key=lambda f: f.stat().st_mtime, reverse=True)
+            if files:
+                print(f"{inst['name']} ({inst['runtime']}): session layout unknown, newest logs:")
+                for f in files[:args.limit]:
+                    ts = datetime.datetime.fromtimestamp(f.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+                    print(f"        {ts}  {f.relative_to(inst['path'])}")
+            continue
+        if not args.all:
+            hidden += sum(1 for s in sessions if not s["here"])
+            sessions = [s for s in sessions if s["here"]]
+        if not sessions:
+            continue
+        print(f"{inst['name']} ({inst['runtime']})")
+        for s in sessions[:args.limit]:
+            rows.append((inst["name"], s["id"]))
+            if s["here"]:
+                here_rows.append(rows[-1])
+            when = datetime.datetime.fromtimestamp(s["mtime"]).strftime("%Y-%m-%d %H:%M")
+            head = f"  {len(rows):>3}  {when}  {short_id(s['id'])}  "
+            text = session_title(s) + ("" if s["here"] else "  [other folder]")
+            room = max(20, width - len(head) - 1)
+            print(head + (text if len(text) <= room else text[:room - 1] + "…"))
+        if len(sessions) > args.limit:
+            print(f"       … {len(sessions) - args.limit} older: cell sessions {inst['name']} -n {len(sessions)}")
+    if hidden and not args.all:
+        print(f"({hidden} more started in other folders: cell sessions --all)")
+    if not rows:
+        print("no sessions in this folder yet" if instances else
+              "no env dirs in this folder yet: start one with  cell run NAME")
+        return
+    name, sid = (here_rows or rows)[0]
+    print(f"\nopen one:  cell {name} -r {short_id(sid)}      latest:  cell {name} -c")
+    if not tty():
+        return
+    pick = ask("open # (Enter = quit)")
+    if not pick:
+        return
+    if not pick.isdigit() or not 1 <= int(pick) <= len(rows):
+        raise CellError(f"no session #{pick}")
+    name, sid = rows[int(pick) - 1]
+    if name not in cfg["blueprints"]:
+        raise CellError(f"'{name}' has an env dir here but no blueprint (cell add {name} …)")
+    return cmd_run(argparse.Namespace(name=name, resume=sid, cont=False, prompt=None, model=None,
+                                      api_key=None, extra=None, voice=False, cmd="run"), cfg)
 
 
 def cmd_clean(args, cfg):
@@ -1482,24 +1859,30 @@ def cmd_clean(args, cfg):
         if not target.exists():
             print(f"{target} does not exist")
             return
-        if confirm(f"Delete {target} (the runtime's GLOBAL config, logins included)?", args.yes):
-            shutil.rmtree(target)
-            print(f"removed {target}")
+        if not confirm(f"Delete {target} (the runtime's GLOBAL config, logins included)?", args.yes):
+            print("nothing deleted")
+            return 1
+        shutil.rmtree(target)
+        print(f"removed {target}")
         return
     instances = find_instances(cwd, get_runtimes(cfg))
+    names = sorted({i["name"] for i in instances})
     if args.name:
-        if not valid_name(args.name):
-            raise CellError("bad name")
-        instances = [i for i in instances if i["name"] == args.name]
+        instances = [i for i in instances if i["name"].lower() == args.name.lower()]
+        if not instances:
+            raise CellError(f"no env dir for '{args.name}' in this folder.{suggest(args.name, names)} "
+                            f"Here: {', '.join(names) or 'none'}")
     if not instances:
-        print("nothing to clean")
+        print("nothing to clean: no env dirs in this folder")
         return
     for inst in instances:
         print(f"  {inst['path']}")
-    if confirm("Delete these instance dirs (sessions and logins inside them are lost)?", args.yes):
-        for inst in instances:
-            shutil.rmtree(inst["path"])
-        print("cleaned")
+    if not confirm("Delete these env dirs? Their sessions and logins are lost.", args.yes):
+        print("nothing deleted")
+        return 1
+    for inst in instances:
+        shutil.rmtree(inst["path"])
+    print("cleaned")
 
 
 def cmd_templates(args, cfg):
@@ -1511,7 +1894,9 @@ def cmd_templates(args, cfg):
     elif args.action == "show":
         text, _ = resolve_template(args.name or "")
         if text is None:
-            raise CellError(f"unknown template '{args.name}'")
+            names = template_names()
+            raise CellError(f"{'which template?' if not args.name else 'unknown template ' + repr(args.name) + '.'}"
+                            f"{suggest(args.name, names) if args.name else ''} One of: {', '.join(names)}")
         print(text)
 
 
@@ -1534,11 +1919,11 @@ def cmd_status(args, cfg):
 
 def cmd_doctor(args, cfg):
     """Health check: one command answers 'is everything set up right?'"""
-    ok = True
+    problems = 0
 
     def bad(msg):
-        nonlocal ok
-        ok = False
+        nonlocal problems
+        problems += 1
         print(f"  ✗ {msg}")
 
     print("config")
@@ -1633,20 +2018,30 @@ def cmd_doctor(args, cfg):
                 bad(f"{inst['path'].name}/settings.json is not valid JSON")
     if not insts:
         print("  (none)")
-    if (cwd / ".git").is_dir() and insts:
+    repo = git_repo(cwd) if insts else None
+    if repo:
         try:
-            r = subprocess.run(["git", "-C", str(cwd), "ls-files"] + [i["path"].name for i in insts],
+            names = [i["path"].name for i in insts]
+            r = subprocess.run(["git", "-C", str(cwd), "ls-files", "--"] + names,
                                capture_output=True, text=True, timeout=10)
-            tracked = sorted({line.split("/", 1)[0] for line in r.stdout.splitlines() if line})
+            tracked = sorted({n for n in names for line in r.stdout.splitlines()
+                              if line == n or line.startswith(n + "/")})
+            r = subprocess.run(["git", "-C", str(cwd), "check-ignore", "--"] + [n + "/" for n in names],
+                               capture_output=True, text=True, timeout=10)
+            ignored = {line.rstrip("/") for line in r.stdout.splitlines()}
+            exposed = [n for n in names if n not in ignored and n not in tracked]
             if tracked:
-                bad(f"committed to git (contain credentials!): {', '.join(tracked)}  "
-                    f"-> git rm -r --cached {' '.join(tracked)}")
-            else:
-                print("  ✓ none tracked by git")
+                bad(f"committed to git (they hold logins!): {', '.join(tracked)}  "
+                    f"-> git rm -r --cached {' '.join(shlex.quote(t) for t in tracked)} && git commit -m 'untrack env dirs'")
+            if exposed:
+                bad(f"not git-ignored: {', '.join(exposed)}  -> next 'cell run' here fixes it, "
+                    f"or: echo '{GIT_EXCLUDE_LINE}' >> {repo[1]}")
+            if not tracked and not exposed:
+                print("  ✓ git-ignored, none committed")
         except (OSError, subprocess.SubprocessError):
             pass
-    print("ok" if ok else "problems found")
-    return 0 if ok else 1
+    print("ok" if not problems else f"{problems} problem{'s' if problems > 1 else ''} found")
+    return 0 if not problems else 1
 
 
 # --------------------------------------------------------------------------
@@ -1752,7 +2147,8 @@ def cmd_import(args, cfg):
 def cmd_init(args, cfg):
     print(f"── {APP} v{VERSION} first-time setup ──")
     existed = config_path().exists()
-    save_config(cfg)
+    if not existed:
+        save_config(cfg)
     print(f"config: {config_path()}{' (already existed, left as is)' if existed else ' (created)'}")
     for d in (seed_dir("claude"), templates_dir()):
         d.mkdir(parents=True, exist_ok=True)
@@ -1766,7 +2162,7 @@ def cmd_init(args, cfg):
     print("\nnext:")
     print("  cell add max --runtime claude --provider anthropic --model opus --login")
     print("  cell add glm --runtime claude --provider zai --model glm-5.3   (then: cell keys set zai)")
-    print("  cd <project> && cell run max")
+    print("  cd <project> && cell max          (same as: cell run max)")
     print("  cell voice setup                     (optional: speak prompts, transcribe voice notes)")
     print("or just type 'cell' for the menu")
 
@@ -2131,6 +2527,18 @@ def _voice_smoke_test(vc, py: Path):
 
 
 def cmd_voice(args, cfg):
+    if not args.action:
+        if not cfg.get("voice"):
+            print("voice is not set up yet: cell voice setup   (local Whisper, private, no key)")
+        else:
+            vc = voice_cfg(cfg)
+            eng = f"local faster-whisper ({vc['model']})" if vc["engine"] == "local" else f"api {vc['api_url']} ({vc['api_model']})"
+            print(f"voice: {eng}, recorder {find_recorder(vc)[1] or 'NONE'}, language {vc['language'] or 'auto'}")
+        print("  cell voice listen               speak; prints the text (stops when you pause)")
+        print("  cell voice transcribe FILE…     voice notes -> text")
+        print("  cell voice setup [--model M]    install / change engine, model, language")
+        print("  cell run NAME --voice           speak the opening prompt of a session")
+        return
     if args.action == "setup":
         return voice_setup(args, cfg)
     if args.action == "listen":
@@ -2172,13 +2580,17 @@ def interactive(cfg):
         for i, (name, bp) in enumerate(bps, 1):
             mark = "•" if name in here else " "
             print(f"  {i} {mark} {name:<14} {bp.get('runtime','')}/{bp.get('provider','')}/{bp.get('model','')}")
-        print("\n  <n> run    s show    a add    e edit    d delete")
-        print("  p providers    k keys    o doctor    q quit")
+        print("\n  <n> run    r resume    c continue    l sessions here    s show")
+        print("  a add    e edit    d delete    p providers    k keys    o doctor    q quit")
+        print("  (r, c, s, e, d take a number too: r2 = resume blueprint 2)")
         try:
-            choice = input("\n> ").strip()
+            choice = input("\n> ").strip().lower()
         except (EOFError, KeyboardInterrupt):
             print()
             return
+        m = re.fullmatch(r"([a-z]?)\s*(\d*)", choice)
+        letter, num = (m.group(1), m.group(2)) if m else (choice, "")
+        actions = {"": "run", "r": "resume", "c": "continue", "s": "show", "e": "edit", "d": "delete"}
         try:
             if choice in ("q", ""):
                 return
@@ -2188,20 +2600,23 @@ def interactive(cfg):
                     cmd_add(argparse.Namespace(name=name, runtime=None, provider=None, model=None,
                                                api_key=None, api_key_env=None, login=False,
                                                persona=None, permissions=None, force=False), cfg)
-            elif choice in ("e", "d", "s") or choice.isdigit():
-                if choice.isdigit():
-                    idx, action = int(choice), "run"
-                else:
-                    action = choice
-                    idx = ask(f"blueprint number to {dict(e='edit', d='delete', s='show')[action]}")
-                    idx = int(idx) if idx.isdigit() else 0
+            elif choice == "l":
+                cmd_sessions(argparse.Namespace(name=None, limit=10, all=False), cfg)
+            elif letter in actions and (num or letter):
+                action = actions[letter]
+                if not num and len(bps) == 1:
+                    num = "1"
+                if not num:
+                    num = ask(f"blueprint number to {action}")
+                idx = int(num) if num.isdigit() else 0
                 if not 1 <= idx <= len(bps):
                     print("no such blueprint")
                     continue
                 name = bps[idx - 1][0]
-                if action == "run":
-                    cmd_run(argparse.Namespace(name=name, resume=None, cont=False, prompt=None,
-                                               model=None, api_key=None, extra=None), cfg)
+                if action in ("run", "resume", "continue"):
+                    cmd_run(argparse.Namespace(name=name, resume=True if action == "resume" else None,
+                                               cont=action == "continue", prompt=None, model=None,
+                                               api_key=None, extra=None, voice=False, cmd="run"), cfg)
                 elif action == "show":
                     cmd_show(argparse.Namespace(name=name, resume=None, cont=False, prompt=None,
                                                 model=None, api_key=None, extra=None), cfg)
@@ -2235,20 +2650,35 @@ def interactive(cfg):
 # Argument parsing
 # --------------------------------------------------------------------------
 
+HELP_DESCRIPTION = """\
+cell — isolated environments for AI agent CLIs (claude, kimi, any other).
+A blueprint is an agent identity: runtime + provider + model + persona.
+'cell run NAME' starts it in the current folder with its own private config
+dir (.<runtime>-env-NAME/): own login, sessions and settings.
+
+Config: ~/.config/cell/config.toml (override with $CELL_HOME)"""
+
 EPILOG = """
-examples:
+every day (in a project folder):
+  cell max                     # start blueprint 'max' here (= cell run max)
+  cell max -c                  # continue the last session
+  cell max -r                  # pick a session to resume (-r ID opens that one)
+  cell sessions                # sessions in this folder with titles; type a number to open
+  cell                         # menu
+
+setup:
   cell add max --runtime claude --provider anthropic --model opus --login
-  cell add glm --runtime claude --provider zai --model glm-5.3 && cell keys set zai
+  cell add glm --provider zai --model glm-5.3 && cell keys set zai
   cell provider add myproxy --base-url http://localhost:4000 --key-env MYPROXY_KEY
-  cell run max                 # in a project dir: creates ./.claude-env-max/ and launches
-  cell run glm -p "explain this repo"
   cell show glm                # dry-run: files, env and command, secrets masked
-  cell import                  # bring your helo blueprints over
+  cell doctor                  # is everything set up right?
+
+'cell COMMAND -h' shows the options of one command.
 """
 
 
 def build_parser():
-    p = argparse.ArgumentParser(prog=APP, description=__doc__, epilog=EPILOG, allow_abbrev=False,
+    p = argparse.ArgumentParser(prog=APP, description=HELP_DESCRIPTION, epilog=EPILOG, allow_abbrev=False,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--version", action="version", version=f"{APP} {VERSION}")
     sub = p.add_subparsers(dest="cmd", metavar="<command>")
@@ -2278,17 +2708,19 @@ def build_parser():
     sp.add_argument("--no-hooks", nargs="*", metavar="EVENT", default=None, help="disable hooks (all, or the named events)")
     sp.add_argument("--hooks", nargs="*", metavar="EVENT", default=None, help="enable hooks (all, or the named events)")
 
-    sub.add_parser("list", help="list blueprints")
-    sp = sub.add_parser("remove", help="delete a blueprint (instance dirs stay)")
+    sub.add_parser("list", help="list blueprints (alias: ls)")
+    sp = sub.add_parser("remove", help="delete a blueprint; env dirs stay (alias: rm)")
     sp.add_argument("name")
 
     for verb, help_ in (("run", "launch an agent in this project"),
                         ("show", "dry-run: what 'run' would do, secrets masked")):
         sp = sub.add_parser(verb, help=help_)
         sp.add_argument("name", nargs="?", help="blueprint (optional when only one applies here)")
-        sp.add_argument("-r", "--resume", nargs="?", const=True, default=None, metavar="ID",
-                        help="resume a session (no ID: the runtime's picker)")
-        sp.add_argument("-c", "--continue", dest="cont", action="store_true", help="continue the most recent session")
+        g = sp.add_mutually_exclusive_group()
+        g.add_argument("-r", "--resume", nargs="?", const=True, default=None, metavar="ID",
+                       help="resume a session: no ID = the runtime's picker; ID = that one "
+                            "(the short id from 'cell sessions' is enough)")
+        g.add_argument("-c", "--continue", dest="cont", action="store_true", help="continue the most recent session")
         sp.add_argument("-p", "--prompt", help="one-shot prompt, then exit")
         sp.add_argument("--model", help="model for this launch only")
         sp.add_argument("--api-key", help="key for this launch only")
@@ -2298,7 +2730,7 @@ def build_parser():
     sub.add_parser("doctor", help="health check: config, runtimes, keys, instances, git")
 
     sp = sub.add_parser("keys", help="global API keys, one per provider")
-    sp.add_argument("action", choices=["set", "list", "remove"])
+    sp.add_argument("action", nargs="?", default="list", choices=["set", "list", "remove"])
     sp.add_argument("provider", nargs="?")
     sp.add_argument("key", nargs="?", help="omit to be prompted (keeps it out of shell history)")
 
@@ -2310,7 +2742,7 @@ def build_parser():
                         description="A provider is an LLM subscription or API account. Built-ins: "
                                     + ", ".join(sorted(DEFAULT_PROVIDERS)) + ". Any Anthropic-compatible "
                                     "endpoint works with the claude runtime: cell provider add NAME --base-url URL.")
-    sp.add_argument("action", choices=["list", "add", "show", "remove"])
+    sp.add_argument("action", nargs="?", default="list", choices=["list", "add", "show", "remove"])
     sp.add_argument("name", nargs="?")
     sp.add_argument("--base-url", help="Anthropic-compatible endpoint (…/anthropic, a proxy, http://localhost:11434)")
     sp.add_argument("--key-env", metavar="VAR", help="env var holding the key (default NAME_API_KEY)")
@@ -2329,7 +2761,7 @@ def build_parser():
                         description="Add ANY CLI as a runtime. Flag values that start with '-' "
                                     "must use the = form, e.g. --model-flag=--model --prompt-flag=-p",
                         allow_abbrev=False)
-    sp.add_argument("action", choices=["list", "add", "install", "remove"])
+    sp.add_argument("action", nargs="?", default="list", choices=["list", "add", "install", "remove"])
     sp.add_argument("name", nargs="?")
     sp.add_argument("--binary")
     sp.add_argument("--env-var", help="env var that relocates the CLI's config dir")
@@ -2347,19 +2779,20 @@ def build_parser():
     sp.add_argument("-y", "--yes", action="store_true")
 
     sp = sub.add_parser("hooks", help="claude hooks applied to every env: list, set, remove, import")
-    sp.add_argument("action", choices=["list", "set", "remove", "import"])
+    sp.add_argument("action", nargs="?", default="list", choices=["list", "set", "remove", "import"])
     sp.add_argument("event", nargs="?", help="stop, user_prompt_submit, post_compact, … (import: env dir)")
     sp.add_argument("command", nargs="?")
 
     sp = sub.add_parser("templates", help="persona templates")
-    sp.add_argument("action", choices=["list", "show"])
+    sp.add_argument("action", nargs="?", default="list", choices=["list", "show"])
     sp.add_argument("name", nargs="?")
 
-    sp = sub.add_parser("sessions", help="conversation sessions in this project")
-    sp.add_argument("name", nargs="?")
-    sp.add_argument("-n", "--limit", type=int, default=10)
+    sp = sub.add_parser("sessions", help="sessions in this folder: id, title; type a number to open one")
+    sp.add_argument("name", nargs="?", help="only this blueprint")
+    sp.add_argument("-n", "--limit", type=int, default=10, help="per blueprint (default 10)")
+    sp.add_argument("--all", action="store_true", help="include sessions started in other folders")
 
-    sp = sub.add_parser("clean", help="remove instance dirs from this project")
+    sp = sub.add_parser("clean", help="delete env dirs in this folder (asks first)")
     sp.add_argument("name", nargs="?")
     sp.add_argument("--global", dest="global_runtime", metavar="RUNTIME", help="remove the runtime's GLOBAL dir (e.g. ~/.claude)")
     sp.add_argument("-y", "--yes", action="store_true")
@@ -2368,7 +2801,7 @@ def build_parser():
                         description="Speak prompts or transcribe voice notes. local engine = faster-whisper in "
                                     "cell's own venv (private, offline); api engine = any OpenAI-compatible "
                                     "/audio/transcriptions endpoint (OpenAI, Groq, …) with a key.")
-    sp.add_argument("action", choices=["setup", "listen", "transcribe"])
+    sp.add_argument("action", nargs="?", choices=["setup", "listen", "transcribe"])
     sp.add_argument("files", nargs="*", help="transcribe: audio files (ogg/opus, m4a, mp3, wav, webm, flac, …)")
     sp.add_argument("-s", "--seconds", type=float, help="listen: fixed length instead of stop-on-silence")
     sp.add_argument("-l", "--language", help="ISO code: en, hi, de, … (default: auto-detect)")
@@ -2395,6 +2828,9 @@ def build_parser():
     return p
 
 
+ALIASES = {"ls": "list", "rm": "remove"}
+RUNTIME_FLAG_OPTS = ("--prompt-flag", "--resume-flag", "--continue-flag", "--model-flag")
+
 COMMANDS = {
     "add": cmd_add, "edit": cmd_edit, "list": cmd_list, "remove": cmd_remove,
     "run": cmd_run, "show": cmd_show, "status": cmd_status, "doctor": cmd_doctor,
@@ -2404,9 +2840,42 @@ COMMANDS = {
 }
 
 
+def rewrite_argv(argv: list) -> list:
+    """Shortcuts before argparse sees the line:
+    cell max -c -> cell run max -c        cell -c / cell -r -> cell run -c / -r
+    cell ls / rm -> list / remove         runtime add --model-flag --model -> --model-flag=--model"""
+    if not argv:
+        return argv
+    first = argv[0]
+    if first in ALIASES:
+        argv = [ALIASES[first]] + argv[1:]
+    elif first in ("-r", "--resume", "-c", "--continue", "-p", "--prompt"):
+        argv = ["run"] + argv
+    elif not first.startswith("-") and first not in COMMANDS:
+        cfg = load_config()
+        try:
+            argv = ["run", resolve_blueprint(cfg, first)] + argv[1:]
+        except CellError:
+            bps = sorted(cfg.get("blueprints", {}))
+            raise CellError(f"'{first}' is not a command or a blueprint.{suggest(first, list(COMMANDS) + bps)}\n"
+                            f"  commands:   {', '.join(COMMANDS)}\n"
+                            f"  blueprints: {', '.join(bps) or 'none yet (cell add NAME)'}")
+    if argv[0] == "runtime":
+        out, i = [], 0
+        while i < len(argv):
+            if argv[i] in RUNTIME_FLAG_OPTS and i + 1 < len(argv) and argv[i + 1].startswith("-"):
+                out.append(f"{argv[i]}={argv[i + 1]}")
+                i += 2
+                continue
+            out.append(argv[i])
+            i += 1
+        argv = out
+    return argv
+
+
 def main():
     p = build_parser()
-    argv = sys.argv[1:]
+    argv = rewrite_argv(sys.argv[1:])
     extra = None
     if "--" in argv:                       # everything after -- goes to the runtime untouched
         i = argv.index("--")

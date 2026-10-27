@@ -17,7 +17,7 @@ A self-hosted, fully-auditable alternative to [helo](https://github.com/ryha0008
 | Bad runtime/provider name | Accepted silently, fails at `run` | **Fails at `add` time** with the list of valid names |
 | Before launch | Nothing | `cell show` — **dry-run: files, env, command, secrets masked** |
 | Secrets | Written into the project's `settings.json` | **Only in the process env at launch**; never inside the project |
-| Git | Env dirs get committed (they hold your logins) | Added to `.git/info/exclude` automatically; `doctor` flags leaks |
+| Git | Env dirs get committed (they hold your logins) | Added to `.git/info/exclude` automatically, from any subfolder or worktree; `doctor` flags leaks |
 | Health check | — | `cell doctor` |
 | Voice input | — | `cell voice`: speak prompts, transcribe voice notes, local Whisper or any speech API |
 | Migrate from helo | — | `cell import` reads your helo config and `.helo.toml` instances |
@@ -50,10 +50,45 @@ cell add kimicode --runtime kimi --provider kimi --model kimi-code/k3 --login
 cd my-project
 cell show glm                           # dry-run: what will happen, secrets masked
 cell run glm                            # creates ./.claude-env-glm/, launches Claude Code on GLM
-cell run max -p "explain this codebase"
-cell run max --continue
+cell max                                # short for: cell run max
+cell max -p "explain this codebase"
+cell max -c                             # continue the last session
+cell max -r                             # pick a session to resume
+cell sessions                           # every session in this folder, with titles; type a number to open
 cell                                    # interactive menu
 ```
+
+Missing flags have sensible defaults: `cell add glm --provider zai` picks the
+claude runtime and the provider's default model, and says so. In a terminal,
+`cell add NAME` asks for each field and re-asks on a typo.
+
+## Sessions
+
+```bash
+cell sessions                 # sessions started in this folder, newest first
+cell sessions max -n 30       # one blueprint, more history
+cell sessions --all           # include sessions started in other folders
+cell max -r 3f2a9c1e          # open one: the 8-character id from the list is enough
+cell max -r                   # or the runtime's own picker
+cell max -c                   # or simply the latest
+```
+
+```
+max (claude)
+    1  2026-10-27 03:44  3f2a9c1e  Fix login redirect loop
+    2  2026-10-24 09:16  b71d04aa  parser-refactor
+kimicode (kimi)
+    3  2026-09-23 23:10  5c8e2d90  add tests for the csv importer
+
+open one:  cell max -r 3f2a9c1e      latest:  cell max -c
+open # (Enter = quit):
+```
+
+Titles come from the runtime itself: your own `/rename` title first, then
+Claude Code's generated title (kimi: its session title), then the last prompt.
+In a terminal, type a number and that session opens in the right runtime
+with the right env dir. A short id works everywhere `-r` does, and
+`cell run -r ID` without a name finds the blueprint that owns the session.
 
 ## Any LLM subscription
 
@@ -102,29 +137,36 @@ For the kimi runtime, providers with a `kimi_catalog` id are registered with
 ## Commands
 
 ```
-cell                        interactive menu
+cell                        interactive menu: run, resume, continue, sessions, show, add, edit, delete
 cell init                   first-time setup
 cell add <n> [--runtime R] [--provider P] [--model M] [--login | --api-key K | --api-key-env VAR]
                             [--persona T|FILE] [--permissions bypass|accept-edits|plan|auto|default]
-                            (missing flags are asked for in a terminal)
+                            (missing flags are asked for in a terminal, or defaulted)
 cell edit <n> [same flags; '' clears] [--no-hooks [EVENT...]] [--hooks [EVENT...]]
-cell list
-cell remove <n>
+                            (no flags: shows the blueprint and what you can change)
+cell list | ls
+cell remove | rm <n>
+cell <n> [run options]      short for: cell run <n>
 cell run [n] [-r [ID] | -c] [-p prompt] [--voice] [--model M] [--api-key K] [-- extra args]
+                            no name: the blueprint with an env dir here, else asks
 cell show [n] [...]         dry-run of `run`: files, env, command, secrets masked
 cell status                 config path, runtimes, instances here
 cell doctor                 health check: config, runtimes, keys, instances, git
-cell keys set|list|remove   global keys, one per provider (set prompts if no key given)
-cell key <n> [key]          per-blueprint key
-cell provider list|add|show|remove
-cell runtime list|add|install|remove
-cell hooks list|set|remove|import
-cell templates list|show    personas: coding, assistant, devops + ~/.config/cell/templates/*.md
-cell voice setup|listen|transcribe FILE…   speak prompts, transcribe voice notes (local or API)
-cell sessions [n]           conversation history in this project
+cell keys [set|list|remove]          global keys, one per provider (set prompts if no key given)
+cell key <n> [key]                   per-blueprint key
+cell provider [list|add|show|remove]
+cell runtime [list|add|install|remove]
+cell hooks [list|set|remove|import]
+cell templates [list|show]           personas: coding, assistant, devops + ~/.config/cell/templates/*.md
+cell voice [setup|listen|transcribe FILE…]   speak prompts, transcribe voice notes (local or API)
+cell sessions [n] [--all] [-n N]     sessions in this folder with titles; type a number to open
 cell clean [n] [-y] [--global RUNTIME]
 cell import [dir] [--config helo.toml] [--recursive] [--force] [--dry-run]
 ```
+
+`keys`, `provider`, `runtime`, `hooks` and `templates` list by default;
+`cell voice` alone shows the voice setup. A mistyped name gets a "did you
+mean" with the valid choices.
 
 ## How isolation works
 
