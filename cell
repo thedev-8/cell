@@ -324,7 +324,7 @@ def dumps_toml(data: dict) -> str:
 # Config
 # --------------------------------------------------------------------------
 
-SECTIONS = ("blueprints", "keys", "runtimes", "providers", "hooks", "voice")
+SECTIONS = ("blueprints", "keys", "runtimes", "providers", "hooks", "voice", "plugins")
 
 
 def empty_config() -> dict:
@@ -910,6 +910,83 @@ def write_instance(plan, cfg, cwd: Path):
     return fresh, copied
 
 
+# Claude Code plugins every claude env should have ([plugins] claude = [...]).
+# Installed with `claude plugin install` into the env dir on its next run.
+PLUGIN_MARKETPLACES = {"claude-plugins-official": "anthropics/claude-plugins-official"}
+
+
+def plugin_id(name: str) -> str:
+    return name if "@" in name else f"{name}@claude-plugins-official"
+
+
+def ensure_plugins(plan, cfg):
+    """Install missing [plugins] into this env (one time per env, ~2 s each)."""
+    if plan["rt"].get("config") != "claude":
+        return
+    want = [plugin_id(x) for x in ((cfg.get("plugins") or {}).get(plan["runtime"]) or [])]
+    if not want:
+        return
+    pdir = plan["env_dir"] / "plugins"
+
+    def keys(name):
+        try:
+            d = json.loads((pdir / name).read_text(encoding="utf-8"))
+            return set(d.get("plugins", d) if name == "installed_plugins.json" else d)
+        except (OSError, ValueError, AttributeError):
+            return set()
+
+    missing = [x for x in want if x not in keys("installed_plugins.json")]
+    binary = which(plan["rt"]["binary"])
+    if not missing or not binary:
+        return
+    env = dict(os.environ)
+    env[plan["rt"]["env_var"]] = str(plan["env_dir"])
+    markets = keys("known_marketplaces.json")
+    for x in missing:
+        mkt = x.split("@", 1)[1]
+        print(f"plugin  installing {x} into this env (one time) …", flush=True)
+        try:
+            if mkt not in markets and mkt in PLUGIN_MARKETPLACES:
+                subprocess.run([binary, "plugin", "marketplace", "add", PLUGIN_MARKETPLACES[mkt]],
+                               env=env, capture_output=True, text=True, timeout=180)
+                markets.add(mkt)
+            r = subprocess.run([binary, "plugin", "install", x], env=env, capture_output=True, text=True, timeout=180)
+            if r.returncode != 0:
+                last = ((r.stdout + r.stderr).strip().splitlines() or ["unknown error"])[-1]
+                warn(f"plugin {x} not installed: {last}")
+        except (OSError, subprocess.SubprocessError) as e:
+            warn(f"plugin {x} not installed: {e}")
+
+
+def cmd_plugins(args, cfg):
+    plugins = cfg.setdefault("plugins", {})
+    rt = args.runtime or "claude"
+    cur = [plugin_id(x) for x in plugins.get(rt, [])]
+    if args.action in (None, "list"):
+        if not cur:
+            print(f"no plugins set for {rt} envs   (add one: cell plugins add pyright-lsp)")
+        for x in cur:
+            print(f"  {x}")
+        if cur:
+            print(f"every {rt} env installs these on its next 'cell run' (if missing)")
+        return
+    if not args.names:
+        raise CellError(f"which plugin? e.g. cell plugins {args.action} pyright-lsp")
+    names = [plugin_id(n) for n in args.names]
+    if args.action == "add":
+        added = [n for n in names if n not in cur]
+        plugins[rt] = cur + added
+        save_config(cfg)
+        print(f"added: {', '.join(added) or 'nothing new'} — each {rt} env installs it on its next 'cell run'")
+    else:
+        gone = [n for n in names if n in cur]
+        if not gone:
+            raise CellError(f"not in the list: {', '.join(names)}. Set: {', '.join(cur) or 'none'}")
+        plugins[rt] = [x for x in cur if x not in gone]
+        save_config(cfg)
+        print(f"removed from the list: {', '.join(gone)} (already installed copies stay; '/plugin' inside claude removes them)")
+
+
 # --------------------------------------------------------------------------
 # Sessions: what each runtime keeps in its env dir
 #   claude: projects/<cwd slug>/<uuid>.jsonl (titles: custom-title, ai-title)
@@ -1447,6 +1524,7 @@ def cmd_run(args, cfg):
         note(f"runtime '{plan['runtime']}' has no continue flag configured; ignoring --continue")
     resume = resolve_session(plan, cfg, args.resume)
     fresh, copied = write_instance(plan, cfg, cwd)
+    ensure_plugins(plan, cfg)
     cmd, env = launch_command(plan, prompt, resume, args.cont, args.model, extra)
     for w in plan["warnings"]:
         warn(w)
@@ -3151,6 +3229,11 @@ def build_parser():
     g.add_argument("--api-model", help="e.g. whisper-1, gpt-4o-mini-transcribe, whisper-large-v3-turbo")
     g.add_argument("--api-key-env", metavar="VAR", help="env var holding the key (or: cell keys set voice)")
 
+    sp = sub.add_parser("plugins", help="Claude Code plugins installed into every claude env (e.g. pyright-lsp)")
+    sp.add_argument("action", nargs="?", choices=["list", "add", "remove"])
+    sp.add_argument("names", nargs="*", help="plugin[@marketplace]; default marketplace claude-plugins-official")
+    sp.add_argument("--runtime", help=argparse.SUPPRESS)
+
     sp = sub.add_parser("learn", help="self-improving instructions: learn rules from your corrections",
                         description="When a claude session ends, cell asks claude (headless, same login) which "
                                     "corrections or lasting preferences you expressed, and adds short rules to "
@@ -3182,7 +3265,7 @@ COMMANDS = {
     "keys": cmd_keys, "key": cmd_key, "provider": cmd_provider, "runtime": cmd_runtime,
     "hooks": cmd_hooks, "templates": cmd_templates, "sessions": cmd_sessions,
     "clean": cmd_clean, "import": cmd_import, "init": cmd_init, "voice": cmd_voice,
-    "learn": cmd_learn,
+    "learn": cmd_learn, "plugins": cmd_plugins,
 }
 
 

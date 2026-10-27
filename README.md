@@ -160,6 +160,7 @@ cell hooks [list|set|remove|import]
 cell templates [list|show]           personas: coding, assistant, devops + ~/.config/cell/templates/*.md
 cell voice [setup|listen|transcribe FILE…]   speak prompts, transcribe voice notes (local or API)
 cell sessions [n] [--all] [-n N]     sessions in this folder with titles; type a number to open
+cell plugins [add|remove NAME…]     Claude Code plugins every claude env installs on its next run
 cell learn [on|off|now|add RULE|remove N|log]  self-improving instructions from your corrections
 cell clean [n] [-y] [--global RUNTIME]
 cell import [dir] [--config helo.toml] [--recursive] [--force] [--dry-run]
