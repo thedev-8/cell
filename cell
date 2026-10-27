@@ -1456,6 +1456,9 @@ def cmd_run(args, cfg):
             note(f"first launch: {binary} will ask you to log in; that login stays private to this env dir")
     else:
         print(f"→ {plan['env_dir']}")
+    unseen = learn_state().get("unseen", 0) if plan["rt"].get("config") == "claude" else 0
+    if unseen:
+        note(f"learned {unseen} new rule(s) from your recent sessions — review: cell learn")
     sys.stdout.flush()
     exec_runtime(cmd, env)
 
@@ -2566,6 +2569,323 @@ def cmd_voice(args, cfg):
 
 
 # --------------------------------------------------------------------------
+# Learn: self-improving instructions
+# --------------------------------------------------------------------------
+# A SessionEnd hook (`cell learn hook`) hands the finished session to a
+# detached `cell learn run`. That reads the transcript, asks the same claude
+# env (headless, no tools, no hooks, nothing saved) which corrections or
+# lasting preferences the user expressed, and writes at most a few short
+# rules into a marked block of the blueprint's persona file, the CLAUDE.md
+# every session of that blueprint loads. `cell learn` lists and removes them.
+
+LEARN_START = "<!-- cell:learned:start (managed by 'cell learn'; edit with 'cell learn remove N') -->"
+LEARN_END = "<!-- cell:learned:end -->"
+LEARN_MAX_RULES = 25
+LEARN_MIN_PROMPTS = 3           # shorter sessions teach nothing
+LEARN_PROMPT = """You keep a short list of standing rules for an AI coding assistant, learned from how its user corrects it.
+
+Below is the end of a conversation: the assistant's last words before each user message, then the user message.
+Find places where the user corrected the assistant, complained, or stated a lasting preference about HOW the
+assistant should work (communication, style, process, tools, safety). Ignore one-off task requests, facts about
+this project, and anything the current instructions or existing rules already cover.
+
+Current instructions:
+<<<
+{persona}
+>>>
+
+Existing learned rules:
+{rules}
+
+Conversation:
+<<<
+{dialog}
+>>>
+
+Only use what the USER explicitly said (a correction, a complaint, "always/never/don't …"). Never infer a rule
+from what the assistant did on its own.
+
+Reply with ONLY a JSON object: {{"rules": [{{"rule": "...", "evidence": "..."}}]}} holding at most 3 NEW rules.
+"rule": one imperative sentence in English, under 25 words, general enough to help in future sessions.
+"evidence": the user's own words that prompted it, copied exactly (a short excerpt).
+Usually nothing qualifies: then reply {{"rules": []}}."""
+
+
+def learn_dir() -> Path:
+    return config_dir() / "learn"
+
+
+def learn_state() -> dict:
+    p = learn_dir() / "rules.json"
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+        if isinstance(data, dict) and isinstance(data.get("rules"), list):
+            return data
+    except (OSError, ValueError):
+        pass
+    return {"rules": [], "unseen": 0}
+
+
+def save_learn_state(state: dict):
+    learn_dir().mkdir(parents=True, exist_ok=True)
+    tmp = learn_dir() / "rules.json.tmp"
+    tmp.write_text(json.dumps(state, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    os.replace(tmp, learn_dir() / "rules.json")
+
+
+def learn_log(msg: str):
+    learn_dir().mkdir(parents=True, exist_ok=True)
+    stamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with open(learn_dir() / "learn.log", "a", encoding="utf-8") as f:
+        f.write(f"{stamp}  {msg}\n")
+
+
+def learn_targets(cfg) -> list:
+    """Persona files of blueprints that learn: claude runtime + a file persona."""
+    out = []
+    runtimes = get_runtimes(cfg)
+    for name, bp in sorted(cfg.get("blueprints", {}).items()):
+        persona = bp.get("persona") or ""
+        if (runtimes.get(bp.get("runtime")) or {}).get("config") != "claude" or not persona:
+            continue
+        p = Path(persona).expanduser()
+        if p.is_file():
+            real = p.resolve()
+            if real not in out:
+                out.append(real)
+    return out
+
+
+def write_learned_block(cfg, rules: list):
+    """Rewrite the managed block in every learning persona file."""
+    lines = [LEARN_START, "## Learned from past sessions", ""]
+    lines += [f"- {r['text']}" for r in rules]
+    lines += [LEARN_END]
+    block = "\n".join(lines)
+    pat = re.compile(re.escape(LEARN_START.split(" (")[0]) + r".*?" + re.escape(LEARN_END), re.S)
+    for f in learn_targets(cfg):
+        try:
+            text = f.read_text(encoding="utf-8")
+        except OSError as e:
+            learn_log(f"cannot read {f}: {e}")
+            continue
+        if pat.search(text):
+            new = pat.sub(lambda m: block if rules else "", text).rstrip("\n") + "\n"
+        elif rules:
+            new = text.rstrip("\n") + "\n\n" + block + "\n"
+        else:
+            continue
+        if new != text:
+            f.write_text(new, encoding="utf-8")
+
+
+def _transcript_dialog(path: Path, skip=0, limit_chars=24000):
+    """(user prompts in total, new ones after `skip`, their 'Claude: … / User: …'
+    text, and the users' own words for evidence checks) from a claude session log."""
+    turns, users, last_assistant, prompts = [], [], "", 0
+    try:
+        with open(path, "rb") as f:
+            for raw in f:
+                if b'"type":"user"' not in raw and b'"type":"assistant"' not in raw:
+                    continue
+                try:
+                    d = json.loads(raw)
+                except ValueError:
+                    continue
+                if d.get("isSidechain") or d.get("isMeta"):
+                    continue
+                c = (d.get("message") or {}).get("content")
+                if isinstance(c, list):
+                    c = " ".join(x.get("text", "") for x in c if isinstance(x, dict) and x.get("type") == "text")
+                if not isinstance(c, str) or not c.strip():
+                    continue
+                c = " ".join(c.split())
+                if d.get("type") == "assistant":
+                    last_assistant = c
+                elif not c.startswith("<"):
+                    prompts += 1
+                    if prompts > skip:
+                        turns.append(f"Claude: {last_assistant[-400:]}\nUser: {c[:1500]}")
+                        users.append(c)
+                    last_assistant = ""
+    except OSError:
+        return 0, 0, "", ""
+    text, out = 0, []
+    for t in reversed(turns):                    # keep the most recent turns that fit
+        if text + len(t) > limit_chars:
+            break
+        out.append(t)
+        text += len(t)
+    return prompts, len(turns), "\n\n".join(reversed(out)), " ".join(users)
+
+
+def learn_from_session(cfg, env_dir: Path, transcript: Path, project: str = "") -> list:
+    """Analyse one session; store and apply new rules. Returns the new rule texts."""
+    meta = read_meta(env_dir)
+    name = meta.get("name", "")
+    bp = cfg["blueprints"].get(name) or {}
+    persona = Path(bp.get("persona") or "").expanduser() if bp.get("persona") else None
+    if not persona or not persona.is_file():
+        learn_log(f"skip {transcript.name}: blueprint '{name}' has no persona file to learn into")
+        return []
+    state = learn_state()
+    seen = state.setdefault("seen", {})
+    sid = transcript.stem
+    total, fresh, dialog, user_words = _transcript_dialog(transcript, skip=int(seen.get(sid, 0)))
+    if fresh < LEARN_MIN_PROMPTS:
+        learn_log(f"skip {sid[:8]}: {fresh} new prompt(s) since last analysis")
+        return []
+    if len(state["rules"]) >= LEARN_MAX_RULES:
+        learn_log(f"skip {transcript.name}: {LEARN_MAX_RULES} rules stored already (cell learn remove N)")
+        return []
+    persona_text = re.sub(re.escape(LEARN_START.split(" (")[0]) + r".*?" + re.escape(LEARN_END), "",
+                          persona.read_text(encoding="utf-8"), flags=re.S)[:6000]
+    prompt = LEARN_PROMPT.format(persona=persona_text.strip() or "(none)", dialog=dialog,
+                                 rules="\n".join(f"- {r['text']}" for r in state["rules"]) or "(none)")
+    rt = get_runtimes(cfg).get(bp.get("runtime")) or DEFAULT_RUNTIMES["claude"]
+    binary = which(rt.get("binary", "claude"))
+    if not binary:
+        learn_log("skip: claude not found in PATH")
+        return []
+    env = dict(os.environ)
+    env[rt.get("env_var", "CLAUDE_CONFIG_DIR")] = str(env_dir)
+    env["CELL_LEARN_CHILD"] = "1"
+    learn_dir().mkdir(parents=True, exist_ok=True)
+    cmd = [binary, "-p", "--model", "sonnet", "--output-format", "json", "--no-session-persistence",
+           "--tools", "", "--settings", json.dumps({"disableAllHooks": True})]
+    try:
+        r = subprocess.run(cmd, input=prompt, capture_output=True, text=True, env=env,
+                           cwd=str(learn_dir()), timeout=300)
+        result = json.loads(r.stdout).get("result", "") if r.stdout.strip() else ""
+    except (OSError, subprocess.SubprocessError, ValueError) as e:
+        learn_log(f"claude call failed for {transcript.name}: {e}")
+        return []
+    m = re.search(r"\{.*\}", result or "", re.S)
+    try:
+        found = json.loads(m.group(0)).get("rules", []) if m else []
+    except ValueError:
+        found = []
+    def norm(x):
+        return " ".join(re.sub(r"[^\w\s]", " ", str(x).lower()).split())
+
+    known = {r["text"].lower() for r in state["rules"]}
+    said = norm(user_words)
+    new = []
+    for item in found if isinstance(found, list) else []:
+        t = " ".join(str(item.get("rule", "") if isinstance(item, dict) else item).split()).lstrip("-• ").strip()
+        ev = norm(item.get("evidence", "")) if isinstance(item, dict) else ""
+        if len(ev) < 6 or ev not in said:               # must quote what the user really said
+            learn_log(f"  dropped (no matching evidence): {t}")
+            continue
+        if 8 <= len(t) <= 220 and t.lower() not in known and len(state["rules"]) < LEARN_MAX_RULES:
+            state["rules"].append({"text": t, "date": datetime.date.today().isoformat(), "project": project,
+                                   "session": sid[:8], "evidence": item.get("evidence", "")[:200]})
+            known.add(t.lower())
+            new.append(t)
+    seen[sid] = total
+    state["unseen"] = int(state.get("unseen", 0)) + len(new)
+    save_learn_state(state)
+    if new:
+        write_learned_block(cfg, state["rules"])
+    learn_log(f"{transcript.stem[:8]} ({project or '?'}): {len(new)} new rule(s)" + "".join(f"\n    + {t}" for t in new))
+    return new
+
+
+def cmd_learn(args, cfg):
+    action = args.action or "list"
+    hook_cmd = f"{shlex.quote(str(Path(sys.argv[0]).resolve()))} learn hook"
+    state = learn_state()
+    if action == "hook":
+        # SessionEnd hook: return at once; the analysis runs detached so quitting stays instant.
+        if os.environ.get("CELL_LEARN_CHILD"):
+            return
+        try:
+            data = json.loads(sys.stdin.read() or "{}")
+        except ValueError:
+            return
+        tp, env_dir = data.get("transcript_path"), os.environ.get("CLAUDE_CONFIG_DIR")
+        if not tp or not env_dir:
+            return
+        learn_dir().mkdir(parents=True, exist_ok=True)
+        with open(learn_dir() / "learn.log", "a") as log:
+            subprocess.Popen([sys.executable, str(Path(sys.argv[0]).resolve()), "learn", "run",
+                              tp, "--env-dir", env_dir, "--project", data.get("cwd") or ""],
+                             stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
+        return
+    if action == "run":
+        if not args.target or not args.env_dir:
+            raise CellError("usage: cell learn run TRANSCRIPT --env-dir DIR")
+        learn_from_session(cfg, Path(args.env_dir), Path(args.target), args.project or "")
+        return
+    if action == "on":
+        if not learn_targets(cfg):
+            raise CellError("no claude blueprint has a persona file to learn into "
+                            "(cell edit NAME --persona ~/path/CLAUDE.md)")
+        cfg["hooks"]["session_end"] = hook_cmd
+        save_config(cfg)
+        print("learning on: when a claude session ends, cell looks for corrections and adds rules to:")
+        for f in learn_targets(cfg):
+            print(f"  {f}")
+        print("applies to each env on its next 'cell run'. Review anytime: cell learn")
+        return
+    if action == "off":
+        if cfg["hooks"].pop("session_end", None) is None:
+            print("learning is already off")
+            return
+        save_config(cfg)
+        print("learning off (envs drop the hook on their next 'cell run'); learned rules stay until 'cell learn remove'")
+        return
+    if action == "now":
+        cwd = Path.cwd()
+        runtimes = get_runtimes(cfg)
+        cands = []
+        for inst in find_instances(cwd, runtimes):
+            if args.target and inst["name"] != args.target.lower():
+                continue
+            for s in (list_sessions(inst, runtimes, cwd) or []):
+                if s["layout"] == "claude" and s["here"]:
+                    cands.append((s["mtime"], inst, s))
+        if not cands:
+            raise CellError("no claude session in this folder to learn from")
+        _, inst, s = max(cands, key=lambda c: c[0])
+        print(f"analysing {inst['name']} session {short_id(s['id'])}: {session_title(s)[:70]} …")
+        new = learn_from_session(cfg, inst["path"], s["path"], str(cwd))
+        print("\n".join(f"  + {t}" for t in new) if new else "nothing new learned (details: cell learn log)")
+        return
+    if action == "log":
+        p = learn_dir() / "learn.log"
+        print("\n".join(p.read_text(encoding="utf-8").splitlines()[-40:]) if p.exists() else "no log yet")
+        return
+    if action == "remove":
+        nums = [n for n in (args.target or "").replace(",", " ").split() if n] + list(args.more or [])
+        if not nums or not all(n.isdigit() and 1 <= int(n) <= len(state["rules"]) for n in nums):
+            raise CellError(f"give rule numbers 1-{len(state['rules'])} (see: cell learn)")
+        drop = {int(n) - 1 for n in nums}
+        gone = [r["text"] for i, r in enumerate(state["rules"]) if i in drop]
+        state["rules"] = [r for i, r in enumerate(state["rules"]) if i not in drop]
+        save_learn_state(state)
+        write_learned_block(cfg, state["rules"])
+        print("removed:\n" + "\n".join(f"  - {t}" for t in gone))
+        return
+    # list
+    on = cfg["hooks"].get("session_end", "").endswith("learn hook")
+    print(f"learning: {'on' if on else 'off'}" + ("" if on else "   (turn on: cell learn on)"))
+    for f in learn_targets(cfg):
+        print(f"writes to: {f}")
+    if not state["rules"]:
+        print("no rules learned yet")
+    for i, r in enumerate(state["rules"], 1):
+        print(f"  {i:>2}. {r['text']}   [{r.get('date', '')}]")
+        if r.get("evidence"):
+            print(f"      you said: \"{r['evidence'][:90]}\"")
+    if state["rules"]:
+        print("\nremove one: cell learn remove N      history: cell learn log      try now: cell learn now")
+    if state.get("unseen"):
+        state["unseen"] = 0
+        save_learn_state(state)
+
+
+# --------------------------------------------------------------------------
 # Interactive menu
 # --------------------------------------------------------------------------
 
@@ -2817,6 +3137,17 @@ def build_parser():
     g.add_argument("--api-model", help="e.g. whisper-1, gpt-4o-mini-transcribe, whisper-large-v3-turbo")
     g.add_argument("--api-key-env", metavar="VAR", help="env var holding the key (or: cell keys set voice)")
 
+    sp = sub.add_parser("learn", help="self-improving instructions: learn rules from your corrections",
+                        description="When a claude session ends, cell asks claude (headless, same login) which "
+                                    "corrections or lasting preferences you expressed, and adds short rules to "
+                                    "the blueprint's persona CLAUDE.md.")
+    sp.add_argument("action", nargs="?", choices=["list", "on", "off", "now", "remove", "log", "hook", "run"],
+                    help="list (default) | on | off | now [NAME] | remove N… | log")
+    sp.add_argument("target", nargs="?", help="now: blueprint; remove: rule number(s)")
+    sp.add_argument("more", nargs="*", help=argparse.SUPPRESS)
+    sp.add_argument("--env-dir", help=argparse.SUPPRESS)
+    sp.add_argument("--project", help=argparse.SUPPRESS)
+
     sp = sub.add_parser("import", help="import helo blueprints (~/.config/helo/config.toml and .helo.toml files)")
     sp.add_argument("dir", nargs="?", help="directory to scan for .helo.toml instance files")
     sp.add_argument("--config", help="path to a helo config.toml (default ~/.config/helo/config.toml)")
@@ -2837,6 +3168,7 @@ COMMANDS = {
     "keys": cmd_keys, "key": cmd_key, "provider": cmd_provider, "runtime": cmd_runtime,
     "hooks": cmd_hooks, "templates": cmd_templates, "sessions": cmd_sessions,
     "clean": cmd_clean, "import": cmd_import, "init": cmd_init, "voice": cmd_voice,
+    "learn": cmd_learn,
 }
 
 

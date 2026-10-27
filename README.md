@@ -160,6 +160,7 @@ cell hooks [list|set|remove|import]
 cell templates [list|show]           personas: coding, assistant, devops + ~/.config/cell/templates/*.md
 cell voice [setup|listen|transcribe FILE…]   speak prompts, transcribe voice notes (local or API)
 cell sessions [n] [--all] [-n N]     sessions in this folder with titles; type a number to open
+cell learn [on|off|now|remove N|log]  self-improving instructions from your corrections
 cell clean [n] [-y] [--global RUNTIME]
 cell import [dir] [--config helo.toml] [--recursive] [--force] [--dry-run]
 ```
@@ -214,6 +215,37 @@ cell edit max --no-hooks stop          # per-blueprint opt-out
 into each new env dir of that runtime (never overwriting), so hook scripts,
 a `settings.json` baseline, or anything a runtime expects is there on first
 launch.
+
+## Self-improving instructions
+
+```bash
+cell learn on        # turn it on (needs a claude blueprint with a persona file)
+cell learn           # rules learned so far, each with the words of yours that prompted it
+cell learn remove 2  # drop one
+cell learn now       # analyse the latest session in this folder right away
+cell learn log       # what happened after each session
+cell learn off
+```
+
+When a Claude Code session ends, a `SessionEnd` hook hands it to cell in the
+background, so quitting stays instant. cell asks the same env, headless with
+no tools, no hooks and nothing saved, which corrections or lasting
+preferences you expressed. At most three short rules come back per session.
+Each must quote your own words, so nothing is inferred from what the
+assistant did by itself. Rules are written into a marked block at the end of
+the blueprint's persona `CLAUDE.md`, so every later session follows them:
+
+```
+<!-- cell:learned:start … -->
+## Learned from past sessions
+
+- Show the exact working command in every error message.
+<!-- cell:learned:end -->
+```
+
+Sessions with fewer than three prompts are skipped, a session is analysed
+only once (a resumed one only for its new prompts), and the list stops at
+25 rules. Each analysis is one short `sonnet` call on that env's login.
 
 ## Voice input
 
