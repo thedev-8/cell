@@ -1626,7 +1626,7 @@ def cmd_key(args, cfg):
 
 VAULT_NAME = re.compile(r"^[a-z0-9][a-z0-9._-]*/[a-z0-9][a-z0-9._-]*$")
 ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-GENERIC_TOKENS = {"api", "key", "token", "secret", "main", "default"}
+GENERIC_TOKENS = {"api", "key", "token", "main", "default"}
 ENV_PREFIXES = ("next_public_", "nuxt_public_", "expo_public_", "react_app_", "vite_", "public_")
 NOT_SECRETS = {"PORT", "HOST", "HOSTNAME", "NODE_ENV", "ENV", "DEBUG", "LOG_LEVEL", "TZ", "LANG", "PATH", "HOME"}
 
@@ -1696,8 +1696,10 @@ def vault_name_for(var: str, provider: str = "") -> str:
     toks = [t for t in v.split("_") if t]
     prov = (provider or toks[0]).lower()
     rest = toks[1:] if toks and toks[0] == prov else ([] if not provider else toks)
-    while rest and rest[-1] in GENERIC_TOKENS:
-        rest.pop()
+    if rest and rest[-1] in ("key", "token"):   # one generic ending only: API_KEY vs API_SECRET stay apart
+        rest = rest[:-1]
+    if rest == ["api"]:
+        rest = []
     return vault_name(f"{prov}/{'-'.join(rest) or 'api'}")
 
 
