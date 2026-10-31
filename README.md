@@ -21,6 +21,7 @@ A self-hosted, fully-auditable alternative to [helo](https://github.com/ryha0008
 | Health check | — | `cell doctor` |
 | Voice input | — | `cell voice`: speak prompts, transcribe voice notes, local Whisper or any speech API |
 | Migrate from helo | — | `cell import` reads your helo config and `.helo.toml` instances |
+| Your projects' API keys | — | `cell vault`: every key stored once as `provider/api`; `use` writes a project's `.env` and git-ignores it |
 
 ## Install
 
@@ -162,13 +163,48 @@ cell voice [setup|listen|transcribe FILE…]   speak prompts, transcribe voice n
 cell sessions [n] [--all] [-n N]     sessions in this folder with titles; type a number to open
 cell plugins [add|remove NAME…]     Claude Code plugins every claude env installs on its next run
 cell learn [on|off|now|add RULE|remove N|log]  self-improving instructions from your corrections
+cell vault [add|use|copy|show|remove|import]   every API key you use, in one owner-only file
 cell clean [n] [-y] [--global RUNTIME]
 cell import [dir] [--config helo.toml] [--recursive] [--force] [--dry-run]
 ```
 
-`keys`, `provider`, `runtime`, `hooks` and `templates` list by default;
+`keys`, `provider`, `runtime`, `hooks`, `templates` and `vault` list by default;
 `cell voice` alone shows the voice setup. A mistyped name gets a "did you
 mean" with the valid choices.
+
+## Key vault
+
+Every API key you use for your projects (not only LLM keys), stored once and
+named `provider/api`, so you stop hunting through old projects for them:
+
+```bash
+cell vault add helius/rpc              # type the key hidden; you're asked its .env name (default HELIUS_RPC_KEY)
+cell vault add openai --note "personal account"     # a bare provider becomes openai/api
+cell vault import ~/work/old-bot/.env  # copy the keys out of an existing .env (shows them, asks first)
+cell vault                             # list: name, variable, masked key, note
+cell vault use helius/rpc openai       # write them into ./.env (owner-only) and git-ignore it
+cell vault use helius/rpc=NEXT_PUBLIC_RPC_KEY       # same key, under the name this project expects
+cell vault copy helius/rpc             # to the clipboard, never shown
+cell vault show helius/rpc [--reveal]
+cell vault remove helius/rpc
+```
+
+```
+3 keys in ~/.config/cell/vault.toml (owner-only)
+  helius/rpc          HELIUS_RPC_KEY      a1b2…9z   free tier
+  openai/api          OPENAI_API_KEY      sk-p…Xy   personal account
+  telegram/bot-token  TELEGRAM_BOT_TOKEN  1234…AA
+```
+
+`use` is how an agent picks keys. Tell it "take the keys you need from the
+vault" and it runs `cell vault use NAME…`. The values go straight from the
+vault into the project's `.env` and never pass through the chat. `use` refuses
+to write into a file git already tracks, and adds the file to `.gitignore`
+(even before `git init`), so an auto-commit hook can't push your keys.
+
+Keys sit unencrypted in an owner-only file (mode 0600). That is the same
+protection `.env` files and `~/.aws/credentials` get: anyone logged in as you
+can read them. `cell doctor` checks the permissions.
 
 ## How isolation works
 

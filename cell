@@ -1618,6 +1618,339 @@ def cmd_key(args, cfg):
     print(f"key set on '{args.name}' ({mask(key)})")
 
 
+# --------------------------------------------------------------------------
+# Key vault: every API key you use, stored once, in one owner-only file.
+# 'cell vault use NAME...' writes keys into a project's .env (and makes git
+# ignore it), so an agent can pick keys by name without ever seeing them.
+# --------------------------------------------------------------------------
+
+VAULT_NAME = re.compile(r"^[a-z0-9][a-z0-9._-]*/[a-z0-9][a-z0-9._-]*$")
+ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+GENERIC_TOKENS = {"api", "key", "token", "secret", "main", "default"}
+ENV_PREFIXES = ("next_public_", "nuxt_public_", "expo_public_", "react_app_", "vite_", "public_")
+NOT_SECRETS = {"PORT", "HOST", "HOSTNAME", "NODE_ENV", "ENV", "DEBUG", "LOG_LEVEL", "TZ", "LANG", "PATH", "HOME"}
+
+
+def vault_path() -> Path:
+    return config_dir() / "vault.toml"
+
+
+def load_vault() -> dict:
+    p = vault_path()
+    if not p.exists():
+        return {}
+    try:
+        with open(p, "rb") as f:
+            data = tomllib.load(f)
+    except tomllib.TOMLDecodeError as e:
+        raise CellError(f"{p} is not valid TOML: {e}\nfix it by hand (it holds your keys, so don't delete it)")
+    keys = data.get("keys") if isinstance(data.get("keys"), dict) else {}
+    return {k: v for k, v in keys.items() if isinstance(v, dict) and v.get("value")}
+
+
+def save_vault(vault: dict):
+    p = vault_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(".toml.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)   # owner-only before any key is written
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write("# cell key vault: your API keys, stored once for every project.\n"
+                "# Owner-only file. Never commit, paste or share it. Manage it with 'cell vault'.\n\n")
+        if vault:
+            f.write(dumps_toml({"keys": dict(sorted(vault.items()))}))
+    os.replace(tmp, p)
+    try:
+        os.chmod(p, 0o600)
+    except OSError:
+        pass
+
+
+def vault_name(raw) -> str:
+    """'Helius RPC' / 'helius/rpc' -> helius/rpc; a bare provider gets /api."""
+    n = re.sub(r"\s+", "-", str(raw or "").strip().lower())
+    if n and "/" not in n:
+        n += "/api"
+    if not VAULT_NAME.match(n):
+        raise CellError(f"'{raw}' is not a valid key name. Use provider/api, e.g. helius/rpc, openai/api, "
+                        f"telegram/bot-token (letters, digits, - _ .)")
+    return n
+
+
+def vault_env_default(name: str) -> str:
+    """helius/api -> HELIUS_API_KEY, helius/rpc -> HELIUS_RPC_KEY, telegram/bot-token -> TELEGRAM_BOT_TOKEN"""
+    prov, _, api = name.partition("/")
+    parts = [prov] + ([] if api in GENERIC_TOKENS else [api])
+    base = re.sub(r"[^A-Za-z0-9]+", "_", "_".join(parts)).strip("_").upper()
+    if len(parts) == 1:
+        return base + "_API_KEY"
+    return base if re.search(r"_(KEY|TOKEN|SECRET|URL|ID|PASSWORD)$", base) else base + "_KEY"
+
+
+def vault_name_for(var: str, provider: str = "") -> str:
+    """HELIUS_API_KEY -> helius/api, TELEGRAM_BOT_TOKEN -> telegram/bot, NEXT_PUBLIC_SUPABASE_URL -> supabase/url"""
+    v = var.lower()
+    for pre in ENV_PREFIXES:
+        if v.startswith(pre) and len(v) > len(pre):
+            v = v[len(pre):]
+            break
+    toks = [t for t in v.split("_") if t]
+    prov = (provider or toks[0]).lower()
+    rest = toks[1:] if toks and toks[0] == prov else ([] if not provider else toks)
+    while rest and rest[-1] in GENERIC_TOKENS:
+        rest.pop()
+    return vault_name(f"{prov}/{'-'.join(rest) or 'api'}")
+
+
+def vault_find(vault: dict, raw, exact: bool = False) -> str:
+    """The entry for 'helius/rpc', or for 'helius' when the vault has one helius key."""
+    n = str(raw or "").strip().lower()
+    if n in vault:
+        return n
+    if not exact and "/" not in n:
+        hits = sorted(k for k in vault if k.split("/")[0] == n)
+        if len(hits) == 1:
+            return hits[0]
+        if hits:
+            raise CellError(f"'{raw}' matches several keys: {', '.join(hits)}. Name one, e.g. {hits[0]}")
+    known = ", ".join(sorted(vault)) or "none yet (cell vault add provider/api)"
+    raise CellError(f"no key '{raw}' in the vault.{suggest(n, vault)} Stored: {known}")
+
+
+def parse_env_file(path: Path) -> list:
+    """[(VAR, value)] from a .env file: export, quotes and trailing comments handled."""
+    out = []
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        m = re.match(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$", line)
+        if not m:
+            continue
+        var, val = m.group(1), m.group(2).strip()
+        q = re.match(r'"((?:[^"\\]|\\.)*)"' if val[:1] == '"' else r"'([^']*)'", val) if val[:1] in "\"'" else None
+        if q:                                   # quoted: take what is inside, ignore a trailing comment
+            val = q.group(1)
+            if m.group(2).strip()[:1] == '"':
+                val = re.sub(r"\\(.)", r"\1", val)
+        else:
+            val = re.split(r"\s+#", val, maxsplit=1)[0].strip()
+        out.append((var, val))
+    return out
+
+
+def _env_quote(value: str) -> str:
+    if re.search(r"[\s#\"'\\$`]", value):
+        return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+    return value
+
+
+def _git(cwd: Path, *args):
+    try:
+        return subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def vault_write_env(target: Path, pairs: list):
+    """Write VAR=value lines into target (update or append), owner-only. In a git repo it refuses a
+    tracked file and adds an untracked one to .gitignore first. -> ([(VAR, status)], gitignore note)"""
+    target = Path(os.path.abspath(target.expanduser()))
+    if not target.parent.is_dir():
+        raise CellError(f"folder {target.parent} does not exist")
+    top = _git(target.parent, "rev-parse", "--show-toplevel")
+    root = Path(top.stdout.strip()) if top and top.returncode == 0 and top.stdout.strip() else None
+    gi_note = ""
+    if root:
+        rel = os.path.relpath(target, root)
+        tracked = _git(root, "ls-files", "--error-unmatch", rel)
+        if tracked and tracked.returncode == 0:
+            raise CellError(f"{rel} is tracked by git, so keys written there would be committed (and pushed by an "
+                            f"auto-commit hook). Untrack it first, then run the same command again:\n"
+                            f"  git -C {root} rm --cached {rel}")
+        ign = _git(root, "check-ignore", "-q", rel)
+        if ign and ign.returncode == 1:                      # 1 = not ignored (0 ignored, 128 error)
+            gi = root / ".gitignore"
+            text = gi.read_text(encoding="utf-8") if gi.exists() else ""
+            with open(gi, "a", encoding="utf-8") as f:
+                f.write(("" if not text or text.endswith("\n") else "\n") + rel.replace(os.sep, "/") + "\n")
+            gi_note = f"added {rel} to .gitignore so git never commits it"
+    else:                                   # not a repo yet: protect it for a later 'git init'
+        gi = target.parent / ".gitignore"
+        text = gi.read_text(encoding="utf-8") if gi.exists() else ""
+        if target.name not in [line.strip().lstrip("/") for line in text.splitlines()]:
+            with open(gi, "a", encoding="utf-8") as f:
+                f.write(("" if not text or text.endswith("\n") else "\n") + target.name + "\n")
+            gi_note = f"added {target.name} to .gitignore (for when this folder becomes a git repo)"
+    lines = target.read_text(encoding="utf-8").splitlines() if target.exists() else []
+    status = []
+    for var, value in pairs:
+        new = f"{var}={_env_quote(value)}"
+        rx = re.compile(rf"^\s*(?:export\s+)?{re.escape(var)}\s*=")
+        idx = next((i for i, line in enumerate(lines) if rx.match(line)), None)
+        if idx is None:
+            lines.append(new)
+            status.append((var, "added"))
+        elif lines[idx] == new:
+            status.append((var, "unchanged"))
+        else:
+            lines[idx] = new
+            status.append((var, "updated"))
+    fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    try:
+        os.chmod(target, 0o600)
+    except OSError:
+        pass
+    return status, gi_note
+
+
+def cmd_vault(args, cfg):
+    vault = load_vault()
+    action, names = args.action or "list", list(args.names or [])
+    if action == "list":
+        if not vault:
+            print("the vault is empty. Add a key (you type it hidden):\n  cell vault add helius/rpc")
+            return
+        wn = max(len(n) for n in vault) + 2
+        we = max(len(e.get("env", "")) for e in vault.values()) + 2
+        print(f"{len(vault)} key{'' if len(vault) == 1 else 's'} in {vault_path()} (owner-only)")
+        for n, e in sorted(vault.items()):
+            print(f"  {n:<{wn}}{e.get('env', ''):<{we}}{mask(e.get('value')):<10}{e.get('note', '')}".rstrip())
+        first = sorted(vault)[0]
+        print(f"\nput keys into a project's .env:  cell vault use {first} ...\n"
+              f"copy one to the clipboard:       cell vault copy {first}")
+    elif action == "add":
+        guided = tty()
+        if len(names) > 1:
+            raise CellError("one key at a time: cell vault add PROVIDER/API")
+        if names:
+            name = vault_name(names[0])
+        elif guided:
+            prov = ask("Provider (the company or service, e.g. helius, openai, telegram)")
+            api = ask("Which API, or what the key is for (e.g. rpc, bot-token)", "api")
+            name = vault_name(f"{prov}/{api}")
+        else:
+            raise CellError("usage: cell vault add PROVIDER/API [--env VAR] [--note TEXT]\n"
+                            "  e.g. cell vault add helius/rpc   (you type the key hidden, or pipe it in)")
+        if name in vault and not args.force:
+            raise CellError(f"'{name}' is already stored ({mask(vault[name]['value'])}). "
+                            f"Replace it: cell vault add {name} --force")
+        env = args.env or (ask("Variable name it gets in .env files", vault_env_default(name)) if guided
+                           else vault_env_default(name))
+        if not ENV_NAME.match(env):
+            raise CellError(f"'{env}' can't be a .env variable name: use letters, digits and _ (e.g. HELIUS_RPC_KEY)")
+        if sys.stdin.isatty():
+            value = ask_secret(f"Key for {name} (input hidden)")
+        else:
+            value = sys.stdin.read().strip()
+        if not value:
+            raise CellError(f"no key given. Run it in a terminal to type it hidden, or pipe it in:\n"
+                            f"  printf %s 'THE_KEY' | cell vault add {name}")
+        if "\n" in value:
+            raise CellError("the key has several lines; the vault holds one-line keys only")
+        note_txt = args.note if args.note is not None else (
+            ask("Note (optional: account, plan, what it is for)") if guided else "")
+        prov, _, api = name.partition("/")
+        vault[name] = {"provider": prov, "api": api, "env": env, "value": value, "note": note_txt,
+                       "added": datetime.date.today().isoformat()}
+        save_vault(vault)
+        print(f"stored {name} as {env} ({mask(value)})\nuse it in a project:  cell vault use {name}")
+    elif action == "use":
+        if not names:
+            raise CellError("which keys? e.g. cell vault use helius/rpc openai   (see them all: cell vault)")
+        picked = []                                     # (entry, variable); NAME=VAR renames for this project
+        for raw in names:
+            n, _, var = raw.partition("=")
+            n = vault_find(vault, n)
+            var = var.strip() or vault[n]["env"]
+            if not ENV_NAME.match(var):
+                raise CellError(f"'{var}' can't be a .env variable name: use letters, digits and _")
+            if (n, var) not in picked:
+                picked.append((n, var))
+        envs = [var for _, var in picked]
+        clash = sorted({e for e in envs if envs.count(e) > 1})
+        if clash:
+            raise CellError(f"several keys would be written as {', '.join(clash)}; pick one, "
+                            f"or rename with NAME=VAR (e.g. {picked[0][0]}=OTHER_NAME)")
+        target = Path(args.to or ".env")
+        status, gi_note = vault_write_env(target, [(var, vault[n]["value"]) for n, var in picked])
+        print(f"{target}:")
+        wv = max(len(var) for var, _ in status) + 2
+        for (var, st), (n, _) in zip(status, picked):
+            print(f"  {st:<10}{var:<{wv}}{mask(vault[n]['value']):<10}from {n}")
+        if gi_note:
+            print(gi_note)
+    elif action == "copy":
+        if len(names) != 1:
+            raise CellError("copy one key: cell vault copy NAME")
+        n = vault_find(vault, names[0])
+        if not _copy_clipboard(vault[n]["value"]):
+            raise CellError("no clipboard tool found: install wl-clipboard (Wayland) or xclip (X11)")
+        print(f"copied {n} ({vault[n]['env']}) to the clipboard")
+    elif action == "show":
+        if len(names) != 1:
+            raise CellError("show one key: cell vault show NAME [--reveal]")
+        n = vault_find(vault, names[0])
+        e = vault[n]
+        for label, val in (("name", n), ("provider", e.get("provider", "")), ("api", e.get("api", "")),
+                           ("variable", e.get("env", "")), ("key", e["value"] if args.reveal else mask(e["value"])),
+                           ("note", e.get("note", "")), ("added", e.get("added", ""))):
+            print(f"  {label:<9} {val}")
+        if not args.reveal:
+            print(f"full key:  cell vault copy {n}   (or --reveal to print it on screen)")
+    elif action == "remove":
+        if not names:
+            raise CellError(f"which key? stored: {', '.join(sorted(vault)) or 'none'}")
+        gone = list(dict.fromkeys(vault_find(vault, n, exact=True) for n in names))
+        if not confirm(f"remove {', '.join(gone)} from the vault?", args.yes):
+            raise CellError("nothing removed")
+        for n in gone:
+            vault.pop(n)
+        save_vault(vault)
+        print(f"removed {', '.join(gone)}")
+    elif action == "import":
+        if not names:
+            raise CellError("usage: cell vault import FILE [VAR ...] [--provider P]\n"
+                            "  e.g. cell vault import ~/work/my-bot/.env")
+        src = Path(names[0]).expanduser()
+        if not src.is_file():
+            raise CellError(f"no such file: {src}")
+        wanted = set(names[1:])
+        new, skipped = {}, []
+        for var, value in parse_env_file(src):
+            if (wanted and var not in wanted) or (not wanted and var in NOT_SECRETS):
+                continue
+            if not value:
+                skipped.append(f"{var}: empty")
+                continue
+            same = [n for n, e in vault.items() if e.get("env") == var and e.get("value") == value]
+            if same:
+                skipped.append(f"{var}: already stored as {same[0]}")
+                continue
+            name = vault_name_for(var, args.provider or "")
+            if (name in vault or name in new) and not args.force:
+                skipped.append(f"{var}: '{name}' already holds a different key (add it under another name, "
+                               f"or --force to replace)")
+                continue
+            prov, _, api = name.partition("/")
+            new[name] = {"provider": prov, "api": api, "env": var, "value": value,
+                         "note": f"imported from {src.parent.name}/{src.name}",
+                         "added": datetime.date.today().isoformat()}
+        for v in sorted(wanted - {var for var, _ in parse_env_file(src)}):
+            skipped.append(f"{v}: not in {src.name}")
+        if new:
+            print(f"from {src}:")
+            for n, e in sorted(new.items()):
+                print(f"  {n:<28}{e['env']:<28}{mask(e['value'])}")
+            if not confirm(f"import {len(new)} key{'' if len(new) == 1 else 's'}?", args.yes):
+                raise CellError("nothing imported")
+            vault.update(new)
+            save_vault(vault)
+            print(f"imported {len(new)} into the vault (see them: cell vault)")
+        else:
+            print(f"nothing new to import from {src}")
+        for s in skipped:
+            print(f"  skipped {s}")
+
+
 def _kv_pairs(items, what):
     out = {}
     for it in items or []:
@@ -2013,6 +2346,17 @@ def cmd_doctor(args, cfg):
         print(f"  ✓ {config_path()}" + ("" if mode == 0o600 or os.name == "nt" else f"  (mode {oct(mode)}, expected 0600)"))
     else:
         bad("no config yet — run 'cell init'")
+    if vault_path().exists():
+        mode = vault_path().stat().st_mode & 0o777
+        try:
+            n_keys = len(load_vault())
+        except CellError as e:
+            bad(str(e).splitlines()[0])
+        else:
+            if mode == 0o600 or os.name == "nt":
+                print(f"  ✓ key vault: {n_keys} key{'' if n_keys == 1 else 's'} (owner-only)")
+            else:
+                bad(f"key vault is readable by others (mode {oct(mode)}): chmod 600 {vault_path()}")
     print("runtimes")
     runtimes, providers = get_runtimes(cfg), get_providers(cfg)
     for name, rt in sorted(runtimes.items()):
@@ -3146,6 +3490,22 @@ def build_parser():
     sp.add_argument("provider", nargs="?")
     sp.add_argument("key", nargs="?", help="omit to be prompted (keeps it out of shell history)")
 
+    sp = sub.add_parser("vault", help="all your API keys in one place; 'use' puts them into a project's .env",
+                        description="Store every API key you use once, named provider/api (helius/rpc, openai/api). "
+                                    "Keys live in an owner-only file in your cell config, never inside a project. "
+                                    "'cell vault use NAME...' writes them into ./.env and makes sure git ignores it.")
+    sp.add_argument("action", nargs="?", choices=["list", "add", "use", "copy", "show", "remove", "import"],
+                    help="list (default) | add NAME | use NAME[=VAR]... | copy NAME | show NAME | remove NAME... | "
+                         "import FILE [VAR...]")
+    sp.add_argument("names", nargs="*", help="key names: provider/api ('helius' works when there is one helius key)")
+    sp.add_argument("--env", metavar="VAR", help="add: variable name written to .env (default from the name)")
+    sp.add_argument("--note", help="add: what the key is for, which account or plan")
+    sp.add_argument("--to", metavar="FILE", help="use: file to write (default ./.env)")
+    sp.add_argument("--provider", help="import: provider name for every imported key")
+    sp.add_argument("--reveal", action="store_true", help="show: print the full key on screen")
+    sp.add_argument("--force", action="store_true", help="add/import: replace a key with the same name")
+    sp.add_argument("-y", "--yes", action="store_true", help="remove/import: don't ask first")
+
     sp = sub.add_parser("key", help="set a per-blueprint key")
     sp.add_argument("name")
     sp.add_argument("key", nargs="?", help="omit to be prompted")
@@ -3265,7 +3625,7 @@ COMMANDS = {
     "keys": cmd_keys, "key": cmd_key, "provider": cmd_provider, "runtime": cmd_runtime,
     "hooks": cmd_hooks, "templates": cmd_templates, "sessions": cmd_sessions,
     "clean": cmd_clean, "import": cmd_import, "init": cmd_init, "voice": cmd_voice,
-    "learn": cmd_learn, "plugins": cmd_plugins,
+    "learn": cmd_learn, "plugins": cmd_plugins, "vault": cmd_vault,
 }
 
 
